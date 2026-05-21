@@ -198,8 +198,8 @@ const IronIcon = ({ className = "" }: { className?: string }) => (
   </svg>
 );
 
-const DrillIcon = ({ className = "" }: { className?: string }) => (
-  <svg className={className} viewBox="0 0 24 24" fill="none">
+const DrillIcon = ({ className = "", style }: { className?: string; style?: React.CSSProperties }) => (
+  <svg className={className} style={style} viewBox="0 0 24 24" fill="none">
     <rect x="2" y="10" width="12" height="5" rx="1.5" fill="#4A5568" stroke="#718096" strokeWidth="1.5"/>
     <polygon points="14,9.5 20,12 14,14.5" fill="#63B3ED" stroke="#4299E1" strokeWidth="1"/>
     <rect x="4" y="11.5" width="2" height="2" rx="0.3" fill="#2D3748"/>
@@ -560,10 +560,6 @@ export default function App() {
           for (let c = 0; c < GRID_SIZE; c++) {
             const t = prev.grid[r][c];
             if (t.type !== "belt") continue;
-            const nb = neighborOf(r, c, t.direction ?? "up");
-            if (!nb) continue;
-            const [nr, nc] = nb;
-            const neighbor = prev.grid[nr][nc];
             // ドリルの隣にベルトがある場合、粒子を流す（視覚演出のみ）
             const above = neighborOf(r, c, { up: "down", right: "left", down: "up", left: "right" }[t.direction ?? "up"] as Direction);
             if (above) {
