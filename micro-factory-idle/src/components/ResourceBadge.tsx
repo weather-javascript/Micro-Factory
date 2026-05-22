@@ -1,42 +1,60 @@
 // ════════════════════════════════════════════════════════════════════
-//  components/ResourceBadge.tsx — リソース表示バッジ
+//  components/ResourceBadge.tsx — リソース・お金・時間帯の表示バッジ
 // ════════════════════════════════════════════════════════════════════
 
-
-import type React from "react";
+import React from "react";
 import { fmt } from "../utils/gameLogic";
 
-interface Props {
+interface ResourceBadgeProps {
   icon: React.ReactNode;
   value: number;
   label: string;
-  /** 毎秒の自動生産量（0またはundefinedなら非表示） */
   perSec?: number;
   color: string;
+  maxValue?: number;   // 在庫上限（省略時は表示なし）
 }
 
-export const ResourceBadge: React.FC<Props> = ({ icon, value, label, perSec, color }) => (
-  <div
-    className="flex flex-col items-center justify-center rounded-xl p-2 gap-0.5 flex-1 min-w-0"
-    style={{ background: "#20202a", border: `1px solid ${color}28` }}
-  >
-    <div style={{ color }}>{icon}</div>
-    <span
-      className="text-[10px] font-bold tracking-widest uppercase"
-      style={{ color: "#555" }}
+export const ResourceBadge: React.FC<ResourceBadgeProps> = ({
+  icon, value, label, perSec, color, maxValue,
+}) => {
+  return (
+    <div
+      className="flex-1 flex items-center gap-2 px-3 py-2.5 rounded-xl"
+      style={{
+        background: "#1a1a24",
+        border: `1px solid ${color}30`,
+        boxShadow: `inset 0 0 12px ${color}08`,
+      }}
     >
-      {label}
-    </span>
-    <span
-      className="text-lg font-bold tabular-nums leading-none"
-      style={{ color }}
-    >
-      {fmt(value)}
-    </span>
-    {perSec !== undefined && perSec > 0 && (
-      <span className="text-[10px]" style={{ color: "#444" }}>
-        +{perSec}/s
-      </span>
-    )}
-  </div>
-);
+      <span style={{ color }}>{icon}</span>
+      <div className="flex flex-col min-w-0">
+        <div className="flex items-baseline gap-1.5">
+          <span
+            className="text-lg font-bold tabular-nums leading-none"
+            style={{ color, fontFamily: "'Courier New', monospace" }}
+          >
+            {fmt(value)}
+          </span>
+          {maxValue !== undefined && (
+            <span className="text-[10px]" style={{ color: `${color}60` }}>
+              /{fmt(maxValue)}
+            </span>
+          )}
+        </div>
+        <div className="flex items-center gap-1.5 mt-0.5">
+          <span className="text-[10px] font-medium" style={{ color: `${color}80` }}>
+            {label}
+          </span>
+          {perSec !== undefined && perSec > 0 && (
+            <span
+              className="text-[10px] tabular-nums"
+              style={{ color: `${color}60` }}
+            >
+              +{perSec}/s
+            </span>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};

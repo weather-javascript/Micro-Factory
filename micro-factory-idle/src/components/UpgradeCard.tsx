@@ -1,104 +1,155 @@
 // ════════════════════════════════════════════════════════════════════
-//  components/UpgradeCard.tsx — 研究タブのアップグレードカード
+//  components/UpgradeCard.tsx — 研究アップグレードカード
 // ════════════════════════════════════════════════════════════════════
 
-import type React from "react";
+import React from "react";
+import type { ResearchRequirement } from "../types";
 
-import type { UpgradeCost } from "../types";
-import { CoinIcon, StoneIcon, IronIcon } from "./Icons";
-import { fmt } from "../utils/gameLogic";
-
-interface Props {
+interface UpgradeCardProps {
   title: string;
   description: string;
-  cost: UpgradeCost;
+  cost: ResearchRequirement;
   purchased: boolean;
   canAfford: boolean;
   onBuy: () => void;
   icon: React.ReactNode;
   accent: string;
+  locked?: boolean;
+  lockReason?: string;
+  /** 現在の資源値（コスト充足表示用） */
+  currentMoney?: number;
+  currentStone?: number;
+  currentIron?: number;
+  currentGear?: number;
 }
 
-export const UpgradeCard: React.FC<Props> = ({
-  title, description, cost, purchased, canAfford, onBuy, icon, accent,
-}) => (
-  <div
-    className="flex items-center gap-3 rounded-xl p-3 transition-all duration-200"
-    style={{
-      background: purchased ? `${accent}12` : "#20202a",
-      border:     `1.5px solid ${purchased ? accent + "60" : "#2e2e3a"}`,
-    }}
-  >
-    {/* アイコン */}
+export const UpgradeCard: React.FC<UpgradeCardProps> = ({
+  title, description, cost, purchased, canAfford, onBuy,
+  icon, accent, locked = false, lockReason,
+  currentMoney = 0, currentStone = 0, currentIron = 0, currentGear = 0,
+}) => {
+  const isDisabled = purchased || !canAfford || locked;
+
+  return (
     <div
-      className="w-11 h-11 rounded-xl flex items-center justify-center shrink-0"
-      style={{ background: `${accent}18`, border: `1px solid ${accent}30` }}
+      className="rounded-xl px-3 py-3 transition-all duration-200"
+      style={{
+        background: purchased
+          ? `${accent}10`
+          : locked
+          ? "#111118"
+          : "#1a1a24",
+        border: `1px solid ${purchased ? accent + "60" : locked ? "#1e1e28" : "#252535"}`,
+        opacity: locked ? 0.6 : 1,
+      }}
     >
-      <div style={{ color: accent }}>{icon}</div>
-    </div>
+      <div className="flex items-start gap-3">
+        {/* アイコン */}
+        <div
+          className="w-10 h-10 rounded-lg flex items-center justify-center shrink-0"
+          style={{
+            background: purchased ? `${accent}20` : "#13131c",
+            border: `1px solid ${purchased ? accent + "50" : "#1e1e2a"}`,
+            color: purchased ? accent : locked ? "#333" : accent + "80",
+          }}
+        >
+          {icon}
+        </div>
 
-    {/* テキスト */}
-    <div className="flex-1 min-w-0">
-      <div
-        className="font-bold text-sm"
-        style={{ color: purchased ? accent : "#ccc" }}
-      >
-        {title}
-      </div>
-      <div className="text-[11px] mt-0.5 leading-snug" style={{ color: "#555" }}>
-        {description}
-      </div>
+        {/* テキスト */}
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2 flex-wrap">
+            <span
+              className="text-sm font-bold"
+              style={{ color: purchased ? accent : locked ? "#444" : "#ccc" }}
+            >
+              {title}
+            </span>
+            {purchased && (
+              <span
+                className="text-[10px] px-1.5 py-0.5 rounded-full font-bold"
+                style={{ background: `${accent}20`, color: accent }}
+              >
+                ✓ 完了
+              </span>
+            )}
+            {locked && lockReason && (
+              <span className="text-[10px]" style={{ color: "#555" }}>
+                🔒 {lockReason}
+              </span>
+            )}
+          </div>
+          <p className="text-[11px] mt-0.5" style={{ color: "#555" }}>
+            {description}
+          </p>
 
-      {/* 複合コスト表示 */}
-      {!purchased && (
-        <div className="flex items-center gap-2 mt-1.5 flex-wrap">
-          <span
-            className="flex items-center gap-0.5 text-[10px] font-bold"
-            style={{ color: canAfford ? "#F5C842" : "#444" }}
-          >
-            <CoinIcon className="w-3 h-3" />{fmt(cost.money)}
-          </span>
-          {cost.stone !== undefined && (
-            <span
-              className="flex items-center gap-0.5 text-[10px] font-bold"
-              style={{ color: canAfford ? "#A0AFBF" : "#444" }}
-            >
-              <StoneIcon className="w-3 h-3" />{cost.stone}
-            </span>
-          )}
-          {cost.iron !== undefined && (
-            <span
-              className="flex items-center gap-0.5 text-[10px] font-bold"
-              style={{ color: canAfford ? "#7BAEC8" : "#444" }}
-            >
-              <IronIcon className="w-3 h-3" />{cost.iron}
-            </span>
+          {/* コスト表示 */}
+          {!purchased && !locked && (
+            <div className="flex flex-wrap gap-2 mt-1.5">
+              {/* コイン */}
+              <CostChip
+                label={`${cost.money}¥`}
+                met={currentMoney >= cost.money}
+                accent="#F5C842"
+              />
+              {cost.stone && (
+                <CostChip
+                  label={`石×${cost.stone}`}
+                  met={currentStone >= cost.stone}
+                  accent="#A0AFBF"
+                />
+              )}
+              {cost.iron && (
+                <CostChip
+                  label={`鉄×${cost.iron}`}
+                  met={currentIron >= cost.iron}
+                  accent="#63B3ED"
+                />
+              )}
+              {cost.gear && (
+                <CostChip
+                  label={`歯車出荷×${cost.gear}`}
+                  met={currentGear >= cost.gear}
+                  accent="#e0c070"
+                />
+              )}
+            </div>
           )}
         </div>
+      </div>
+
+      {/* 購入ボタン */}
+      {!purchased && !locked && (
+        <button
+          onClick={onBuy}
+          disabled={isDisabled}
+          className="w-full mt-3 py-2 rounded-lg text-sm font-bold transition-all duration-150 active:scale-98"
+          style={{
+            background: canAfford ? `${accent}20` : "#13131c",
+            border: `1px solid ${canAfford ? accent : "#2a2a38"}`,
+            color: canAfford ? accent : "#333",
+            cursor: canAfford ? "pointer" : "not-allowed",
+          }}
+        >
+          {canAfford ? "研究する" : "素材不足"}
+        </button>
       )}
     </div>
+  );
+};
 
-    {/* ボタン or 習得済バッジ */}
-    {purchased ? (
-      <span
-        className="text-[10px] font-bold px-2 py-1 rounded-lg shrink-0"
-        style={{ background: `${accent}22`, color: accent }}
-      >
-        習得済
-      </span>
-    ) : (
-      <button
-        onClick={onBuy}
-        disabled={!canAfford}
-        className="text-xs font-bold px-3 py-2 rounded-xl transition-all active:scale-95 disabled:opacity-30 disabled:cursor-not-allowed shrink-0"
-        style={{
-          background: canAfford ? `${accent}22` : "#1a1a22",
-          border:     `1px solid ${canAfford ? accent : "#333"}`,
-          color:      canAfford ? accent : "#444",
-        }}
-      >
-        研究
-      </button>
-    )}
-  </div>
+/** コスト充足表示チップ */
+const CostChip: React.FC<{ label: string; met: boolean; accent: string }> = ({
+  label, met, accent,
+}) => (
+  <span
+    className="text-[10px] px-1.5 py-0.5 rounded font-medium"
+    style={{
+      background: met ? `${accent}15` : "#1a1a24",
+      border: `1px solid ${met ? accent + "50" : "#252535"}`,
+      color: met ? accent : "#444",
+    }}
+  >
+    {met ? "✓ " : ""}{label}
+  </span>
 );

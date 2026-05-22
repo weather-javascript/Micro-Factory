@@ -1,364 +1,614 @@
 // ════════════════════════════════════════════════════════════════════
-//  utils/gameLogic.ts — 純粋関数群（副作用なし）
-//  ゲームループ内の計算・物流ロジック・各種判定をすべてここに集約。
-//  描画側のperSec計算もこのファイルから流用し、重複を排除する。
+//  utils/gameLogic.ts — ゲームのコアロジック（純粋関数）
+//  ゲームループ内で毎フレーム呼び出される物理物流・生産計算を担当。
 // ════════════════════════════════════════════════════════════════════
 
-import type {
-  Tile, TileType, Direction, BeltItem,
-  GameState, TickResult, DayPhase, Upgrades,
-} from "../types";
+import type { GameState, Tile, Direction, ItemKind, BeltItem } from "../types";
 import {
-  GRID_SIZE, DIR_ORDER, DIR_DELTA,
-  SOLAR_POWER_DAY, SOLAR_POWER_NIGHT,
-  BATTERY_CAPACITY, BATTERY_CHARGE_RATE, BATTERY_DISCHARGE_RATE,
-  POWER_USE, SELL_RATE, HUB_POSITION, PHASE_DURATION_TICKS,
+  HUB_ROW, HUB_COL,
+  BELT_SPEED, FAST_BELT_SPEED,
+  DRILL_PRODUCTION_INTERVAL, IRON_DRILL_INTERVAL,
+  ASSEMBLER_INTERVAL, GEAR_RECIPE,
+  SELL_RATES, POWER_CONSUMPTION, LOW_POWER_EFFICIENCY,
+  DAY_DURATION, NIGHT_DURATION,
+  SOLAR_POWER, BATTERY_CAPACITY, LARGE_BATTERY_MULTIPLIER,
+  DEPOSIT_RESPAWN_INTERVAL, INITIAL_STONE_DEPOSITS,
+  ROCKET_REQUIREMENTS,
 } from "../constants";
+import type { ProdStats, StatsSnapshot } from "../types";
 
-// ════════════════════════════════════════════════════════════════════
-//  ■ グリッドユーティリティ
-// ════════════════════════════════════════════════════════════════════
+// ─── 数値フォーマット ─────────────────────────────────────────────────
 
-/** 方向と座標から隣のマス座標を返す（範囲外はnull） */
-export function neighborOf(
-  r: number,
-  c: number,
-  dir: Direction
+/** 数値を見やすい形式に変換（例: 1200 → 1.2k） */
+export function fmt(n: number): string {
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
+  if (n >= 10_000)    return (n / 1_000).toFixed(1) + "k";
+  return Math.floor(n).toString();
+}
+
+// ─── 隣接タイル取得 ──────────────────────────────────────────────────
+
+/** 指定方向の隣接マスの座標を返す */
+export function getNeighbor(
+  row: number, col: number, dir: Direction, gridSize: number
 ): [number, number] | null {
-  const [dr, dc] = DIR_DELTA[dir];
-  const nr = r + dr;
-  const nc = c + dc;
-  if (nr < 0 || nr >= GRID_SIZE || nc < 0 || nc >= GRID_SIZE) return null;
+  const deltas: Record<Direction, [number, number]> = {
+    up:    [-1,  0],
+    right: [ 0,  1],
+    down:  [ 1,  0],
+    left:  [ 0, -1],
+  };
+  const [dr, dc] = deltas[dir];
+  const nr = row + dr;
+  const nc = col + dc;
+  if (nr < 0 || nr >= gridSize || nc < 0 || nc >= gridSize) return null;
   return [nr, nc];
 }
 
-/** ベルトの向きを時計回りに90度回転させる */
-export function nextDirection(d: Direction): Direction {
-  return DIR_ORDER[(DIR_ORDER.indexOf(d) + 1) % 4];
+/** 指定方向からの反対方向（入口判定に使用） */
+export function opposite(dir: Direction): Direction {
+  const map: Record<Direction, Direction> = {
+    up: "down", down: "up", left: "right", right: "left",
+  };
+  return map[dir];
 }
 
-/** ShopItemをそのマスに配置できるか判定する */
-export function canPlace(tile: Tile, item: string | null): boolean {
-  if (!item || item === "demolish") return false;
-  if (tile.type === "hub") return false; // Hubは上書き不可
-  if (item === "stone_drill") return tile.type === "stone_deposit";
-  if (item === "iron_drill")  return tile.type === "iron_deposit";
-  if (item === "belt")        return tile.type === "empty";
-  if (item === "solar")       return tile.type === "empty";
-  if (item === "battery")     return tile.type === "empty";
-  return false;
-}
-
-/** 解体可能なタイルかどうか */
-export function canDemolish(tile: Tile): boolean {
-  return (
-    tile.type === "stone_drill" ||
-    tile.type === "iron_drill"  ||
-    tile.type === "belt"        ||
-    tile.type === "solar"       ||
-    tile.type === "battery"
-  );
-}
-
-/** 解体後に戻るタイルの種別（鉱床の上のドリルは鉱床に戻す） */
-export function demolishedType(tile: Tile): TileType {
-  if (tile.type === "stone_drill") return "stone_deposit";
-  if (tile.type === "iron_drill")  return "iron_deposit";
-  return "empty";
-}
-
-// ════════════════════════════════════════════════════════════════════
-//  ■ 昼夜サイクル
-// ════════════════════════════════════════════════════════════════════
-
-/** ティック数から昼夜フェーズを計算する */
-export function calcDayPhase(tick: number): DayPhase {
-  const cycle = Math.floor(tick / PHASE_DURATION_TICKS) % 2;
-  return cycle === 0 ? "day" : "night";
-}
-
-/** ティック内での進行度（0.0 〜 1.0） */
-export function phaseProgress(tick: number): number {
-  return (tick % PHASE_DURATION_TICKS) / PHASE_DURATION_TICKS;
-}
-
-// ════════════════════════════════════════════════════════════════════
-//  ■ 電力計算（描画 & ゲームループ共通）
-// ════════════════════════════════════════════════════════════════════
-
-export interface PowerStats {
-  powerUsed: number;
-  solarGen: number;  // ソーラー発電量（昼夜考慮前）
-  batteryCnt: number;
-}
-
-/** グリッドから電力消費・発電量を集計する */
-export function calcPowerStats(grid: Tile[][], phase: DayPhase): PowerStats {
-  let powerUsed = 0;
-  let solarGen  = 0;
-  let batteryCnt = 0;
-  const solarPower = phase === "day" ? SOLAR_POWER_DAY : SOLAR_POWER_NIGHT;
-
-  for (const row of grid) {
-    for (const t of row) {
-      if (t.type === "stone_drill") powerUsed += POWER_USE.stone_drill;
-      if (t.type === "iron_drill")  powerUsed += POWER_USE.iron_drill;
-      if (t.type === "solar")       solarGen  += solarPower;
-      if (t.type === "battery")     batteryCnt++;
-    }
-  }
-  return { powerUsed, solarGen, batteryCnt };
-}
-
-// ════════════════════════════════════════════════════════════════════
-//  ■ 生産量計算（描画用 perSec 表示と共通）
-// ════════════════════════════════════════════════════════════════════
-
-export interface ProductionStats {
-  stoneDrillCnt: number;
-  ironDrillCnt: number;
-  beltCnt: number;
-  solarCnt: number;
-  batteryCnt: number;
-  stonePerSec: number;  // 実効的な毎秒石生産量
-  ironPerSec: number;   // 実効的な毎秒鉄生産量
-  efficiency: number;   // 電力効率（1.0 or 0.5）
-}
+// ─── 電力計算 ────────────────────────────────────────────────────────
 
 /**
- * グリッドと各種状態から生産量統計を計算する。
- * ゲームループ内と描画側のperSec表示の両方で使用することで重複を排除。
+ * 現在の電力状況を計算する。
+ * ソーラーは昼のみ発電。蓄電池は夜に放電、昼に充電。
  */
-export function calcProductionStats(
-  grid: Tile[][],
-  phase: DayPhase,
-  batteryCharge: number,
-  batteryMax: number,
-  upgrades: Upgrades
-): ProductionStats {
-  let stoneDrillCnt = 0, ironDrillCnt = 0, beltCnt = 0, solarCnt = 0, batteryCnt = 0;
+export function calcPower(state: GameState): {
+  powerUsed: number;
+  powerMax: number;
+  batteryCharge: number;
+  batteryMax: number;
+  efficiency: number;
+} {
+  const { grid, gridSize, dayPhase, upgrades } = state;
+  let used = 0;
+  let solar = 0;
+  let batteryCnt = 0;
 
-  for (const row of grid) {
-    for (const t of row) {
-      if (t.type === "stone_drill") stoneDrillCnt++;
-      if (t.type === "iron_drill")  ironDrillCnt++;
-      if (t.type === "belt")        beltCnt++;
-      if (t.type === "solar")       solarCnt++;
-      if (t.type === "battery")     batteryCnt++;
+  for (let r = 0; r < gridSize; r++) {
+    for (let c = 0; c < gridSize; c++) {
+      const t = grid[r][c];
+      const pw = POWER_CONSUMPTION[t.kind];
+      if (pw) used += pw;
+      if (t.kind === "solar") solar += SOLAR_POWER;
+      if (t.kind === "battery") batteryCnt++;
     }
   }
 
-  const { powerUsed, solarGen } = calcPowerStats(grid, phase);
-  // 夜間は蓄電池から放電してカバー
-  const batterySupply = phase === "night" ? Math.min(batteryCharge, BATTERY_DISCHARGE_RATE * batteryCnt) : 0;
-  const powerMax = solarGen + batterySupply;
-  const powerOk  = powerUsed <= powerMax || (powerUsed === 0);
-  const efficiency = powerOk ? 1.0 : 0.5;
+  const isDay = dayPhase === "day";
+  // 昼はソーラー発電、夜は0
+  const solarOutput = isDay ? solar : 0;
 
-  const drillBonus = upgrades.turbodrillBoost ? 1 : 0;
-  const stonePerSec = Math.floor(stoneDrillCnt * (1 + drillBonus) * efficiency);
-  const ironPerSec  = Math.floor(ironDrillCnt  * (1 + drillBonus) * efficiency);
+  const battMult = upgrades.largeBattery ? LARGE_BATTERY_MULTIPLIER : 1;
+  const battMax = batteryCnt * BATTERY_CAPACITY * battMult;
+
+  // 実際に利用できる電力 = ソーラー + 蓄電池放電（夜のみ）
+  const availablePower = isDay
+    ? solarOutput
+    : solarOutput + Math.min(state.batteryCharge, used); // 夜は蓄電池から補う
+
+  const totalAvailable = isDay ? solarOutput : availablePower;
+  const efficiency = used <= 0 ? 1.0 : Math.min(1.0, totalAvailable / used) < LOW_POWER_EFFICIENCY
+    ? LOW_POWER_EFFICIENCY
+    : Math.min(1.0, used <= totalAvailable ? 1.0 : LOW_POWER_EFFICIENCY);
 
   return {
-    stoneDrillCnt, ironDrillCnt, beltCnt, solarCnt, batteryCnt,
-    stonePerSec, ironPerSec, efficiency,
+    powerUsed: used,
+    powerMax: isDay ? solar : state.batteryCharge,
+    batteryCharge: state.batteryCharge,
+    batteryMax: battMax,
+    efficiency: (used === 0 || totalAvailable >= used) ? 1.0 : LOW_POWER_EFFICIENCY,
   };
 }
 
-// ════════════════════════════════════════════════════════════════════
-//  ■ 物流ロジック（ベルトコンベア搬送 + Hub自動売却）
-// ════════════════════════════════════════════════════════════════════
+// ─── 蓄電池の充放電 ──────────────────────────────────────────────────
 
 /**
- * 1ティック分のベルト搬送を処理する。
- *
- * アルゴリズム概要:
- * 1. ドリルが隣接するベルトへアイテムを排出する
- * 2. ベルト上のアイテムを direction の方向へ移動させる
- *    （ループを防ぐため、Hub方向を優先して逆流しないよう処理順を工夫）
- * 3. Hubに到達したアイテムは即時売却（moneyFromHub に加算）
- *
- * @returns [新しいグリッド, hubで稼いだコイン]
+ * 1ティック（dt秒）分の蓄電池充放電を計算する。
+ * 昼: 余剰電力を充電。夜: 消費電力を放電。
+ * @returns 更新後の batteryCharge
  */
-export function processBeltTick(
-  grid: Tile[][],
-  drillBonus: number,
-  efficiency: number
-): [Tile[][], number] {
-  // ─ Step1: グリッドをディープコピー
-  const next: Tile[][] = grid.map(row =>
-    row.map(t => ({ ...t, beltParticle: null as BeltItem }))
-  );
-  let moneyFromHub = 0;
+export function updateBattery(state: GameState, dt: number): number {
+  const { dayPhase, powerUsed, upgrades } = state;
+  const { grid, gridSize } = state;
 
-  // ─ Step2: ドリルが隣のベルトへアイテムを排出
-  //   ドリルは「自分の下方向」のベルトに排出する（向きはbeltの向きに依存）
-  for (let r = 0; r < GRID_SIZE; r++) {
-    for (let c = 0; c < GRID_SIZE; c++) {
+  let solar = 0;
+  let batteryCnt = 0;
+  for (let r = 0; r < gridSize; r++) {
+    for (let c = 0; c < gridSize; c++) {
       const t = grid[r][c];
-      const isDrill = t.type === "stone_drill" || t.type === "iron_drill";
-      if (!isDrill) continue;
-
-      const item: BeltItem = t.type === "stone_drill" ? "stone" : "iron";
-      // 周囲4方向にベルトがあれば排出（最初に見つかった1つへ）
-      for (const dir of DIR_ORDER) {
-        const nb = neighborOf(r, c, dir);
-        if (!nb) continue;
-        const [nr, nc] = nb;
-        const nbTile = next[nr][nc];
-        if (nbTile.type === "belt" && !nbTile.beltItem) {
-          // effectivenessを考慮：50%効率なら50%の確率で排出
-          if (Math.random() < efficiency) {
-            next[nr][nc] = { ...nbTile, beltItem: item, beltParticle: item };
-          }
-          break;
-        }
-        // Hubに直接隣接している場合も売却
-        if (nbTile.type === "hub") {
-          if (Math.random() < efficiency) {
-            moneyFromHub += SELL_RATE[item];
-            next[r][c] = { ...next[r][c], beltParticle: item };
-          }
-          break;
-        }
-      }
+      if (t.kind === "solar") solar += SOLAR_POWER;
+      if (t.kind === "battery") batteryCnt++;
     }
   }
 
-  // ─ Step3: ベルト上のアイテムを搬送
-  //   Hubに近いマスから処理することで、同一ティックでHub到達を実現
-  const [hr, hc] = HUB_POSITION;
-  // 全ベルトマスを Hub からの距離でソート（BFS的な処理順）
-  const beltCoords: [number, number, number][] = []; // [r, c, dist]
-  for (let r = 0; r < GRID_SIZE; r++) {
-    for (let c = 0; c < GRID_SIZE; c++) {
-      if (next[r][c].type === "belt") {
-        const dist = Math.abs(r - hr) + Math.abs(c - hc);
-        beltCoords.push([r, c, dist]);
-      }
-    }
-  }
-  // Hubに近い順（昇順）に処理
-  beltCoords.sort((a, b) => a[2] - b[2]);
-
-  for (const [r, c] of beltCoords) {
-    const t = next[r][c];
-    if (!t.beltItem) continue;
-
-    const dir = t.direction ?? "up";
-    const nb  = neighborOf(r, c, dir);
-    if (!nb) {
-      // グリッド外 → アイテム消滅
-      next[r][c] = { ...t, beltItem: null };
-      continue;
-    }
-
-    const [nr, nc] = nb;
-    const dest = next[nr][nc];
-
-    if (dest.type === "hub") {
-      // Hub到達 → 自動売却
-      moneyFromHub += SELL_RATE[t.beltItem as "stone" | "iron"];
-      next[r][c]   = { ...t, beltItem: null };
-    } else if (dest.type === "belt" && !dest.beltItem) {
-      // 隣のベルトへ移動
-      next[nr][nc] = { ...dest, beltItem: t.beltItem, beltParticle: t.beltItem };
-      next[r][c]   = { ...t, beltItem: null };
-    }
-    // 行き先が埋まっている・ベルト以外 → 待機（アイテムはそのまま）
-  }
-
-  return [next, moneyFromHub];
-}
-
-// ════════════════════════════════════════════════════════════════════
-//  ■ メインゲームティック計算
-// ════════════════════════════════════════════════════════════════════
-
-/**
- * 1ティック分のゲーム状態を計算して返す純粋関数。
- * setState の中で呼び出すことで、副作用ゼロでテスト可能。
- */
-export function calcTick(state: GameState): Partial<GameState> {
-  const newTick   = state.tick + 1;
-  const dayPhase  = calcDayPhase(newTick);
-
-  // 電力・発電量を集計
-  const { powerUsed, solarGen, batteryCnt } = calcPowerStats(state.grid, dayPhase);
-
-  // 蓄電池の充放電
-  let batteryCharge = state.batteryCharge;
-  const battMax     = batteryCnt * BATTERY_CAPACITY;
+  const battMult = upgrades.largeBattery ? LARGE_BATTERY_MULTIPLIER : 1;
+  const battMax = batteryCnt * BATTERY_CAPACITY * battMult;
 
   if (dayPhase === "day") {
-    // 昼: 余剰電力で充電
-    const surplus = Math.max(0, solarGen - powerUsed);
-    batteryCharge = Math.min(battMax, batteryCharge + Math.min(surplus, BATTERY_CHARGE_RATE * batteryCnt));
+    // 余剰電力を充電（ソーラー - 消費）
+    const surplus = Math.max(0, solar - powerUsed);
+    return Math.min(battMax, state.batteryCharge + surplus * dt);
   } else {
-    // 夜: 蓄電池から放電
-    const discharge = Math.min(batteryCharge, BATTERY_DISCHARGE_RATE * batteryCnt);
-    batteryCharge = Math.max(0, batteryCharge - discharge);
+    // 夜: 消費分を放電
+    return Math.max(0, state.batteryCharge - powerUsed * dt);
+  }
+}
+
+// ─── 生産統計の集計 ──────────────────────────────────────────────────
+
+/** グリッドから生産統計を集計する */
+export function calcProdStats(state: GameState): ProdStats {
+  const { grid, gridSize, upgrades, dayPhase } = state;
+  let stoneDrillCnt = 0;
+  let ironDrillCnt = 0;
+  let beltCnt = 0;
+  let solarCnt = 0;
+  let batteryCnt = 0;
+  let assemblerCnt = 0;
+
+  for (let r = 0; r < gridSize; r++) {
+    for (let c = 0; c < gridSize; c++) {
+      const k = grid[r][c].kind;
+      if (k === "stone_drill") stoneDrillCnt++;
+      else if (k === "iron_drill") ironDrillCnt++;
+      else if (k === "belt") beltCnt++;
+      else if (k === "solar") solarCnt++;
+      else if (k === "battery") batteryCnt++;
+      else if (k === "assembler") assemblerCnt++;
+    }
   }
 
-  // 実効電力最大値（ソーラー + 今ティックの蓄電池放電）
-  const batterySupply = dayPhase === "night"
-    ? Math.min(state.batteryCharge, BATTERY_DISCHARGE_RATE * batteryCnt)
-    : 0;
-  const powerMax  = solarGen + batterySupply;
-  const powerOk   = powerUsed <= powerMax || powerUsed === 0;
-  const efficiency = powerOk ? 1.0 : 0.5;
+  const { efficiency } = calcPower(state);
+  const drillBonus = upgrades.turbodrillBoost ? 1 : 0;
+  const stonePerSec = Math.floor(
+    stoneDrillCnt * (1 / DRILL_PRODUCTION_INTERVAL + drillBonus) * efficiency
+  );
+  const ironPerSec = Math.floor(
+    ironDrillCnt * (1 / IRON_DRILL_INTERVAL + drillBonus * 0.5) * efficiency
+  );
 
-  const drillBonus = state.upgrades.turbodrillBoost ? 1 : 0;
+  // 収入/秒は歯車ベルト出荷による概算
+  const incomePerSec = 0;
 
-  // 物流処理（ベルト搬送 + Hub売却）
-  const [newGrid, moneyFromHub] = processBeltTick(state.grid, drillBonus, efficiency);
+  return {
+    stoneDrillCnt,
+    ironDrillCnt,
+    beltCnt,
+    solarCnt,
+    batteryCnt,
+    assemblerCnt,
+    stonePerSec,
+    ironPerSec,
+    incomePerSec,
+    efficiency,
+  };
+}
 
-  // インベントリへの直接加算は行わない（物流経由のみ）
-  // ただし、ベルトが接続されていないドリルはインベントリへ
-  let stonePlus = 0, ironPlus = 0;
-  for (let r = 0; r < GRID_SIZE; r++) {
-    for (let c = 0; c < GRID_SIZE; c++) {
-      const t = state.grid[r][c];
-      if (t.type !== "stone_drill" && t.type !== "iron_drill") continue;
+// ─── ベルト物流のシミュレーション ────────────────────────────────────
 
-      // 隣にベルトやHubがない孤立ドリルはインベントリへ直接
-      let hasBeltNeighbor = false;
-      for (const dir of DIR_ORDER) {
-        const nb = neighborOf(r, c, dir);
-        if (!nb) continue;
-        const [nr, nc] = nb;
-        const nbType = state.grid[nr][nc].type;
-        if (nbType === "belt" || nbType === "hub") { hasBeltNeighbor = true; break; }
-      }
-      if (!hasBeltNeighbor) {
-        const prod = (1 + drillBonus) * efficiency;
-        if (t.type === "stone_drill") stonePlus += prod;
-        if (t.type === "iron_drill")  ironPlus  += prod;
+/**
+ * 1ティック分のベルト物流を更新する。
+ *
+ * アルゴリズム概要:
+ * 1. 各タイルのアイテムの progress を belt_speed * dt だけ進める。
+ * 2. progress >= 1.0 になったアイテムは「次のタイル」への移動を試みる。
+ * 3. 次のタイルが:
+ *    - hub → アイテムを売却（money加算）
+ *    - belt/assembler（空き）→ 移動
+ *    - 詰まっている（occupied）→ 移動をブロック（progress = 1.0でキープ）
+ *
+ * @returns 更新後のグリッドと獲得コイン・各素材のカウント
+ */
+export function tickBeltPhysics(
+  state: GameState,
+  dt: number
+): {
+  newGrid: Tile[][];
+  earnedMoney: number;
+  shippedStone: number;
+  shippedIron: number;
+  shippedGear: number;
+} {
+  const { grid, gridSize, upgrades } = state;
+  const beltSpeed = upgrades.fastBelt ? FAST_BELT_SPEED : BELT_SPEED;
+
+  // グリッドをディープコピー（参照が混入しないように）
+  const newGrid: Tile[][] = grid.map(row =>
+    row.map(t => ({ ...t, beltItem: t.beltItem ? { ...t.beltItem } : null }))
+  );
+
+  let earnedMoney = 0;
+  let shippedStone = 0;
+  let shippedIron = 0;
+  let shippedGear = 0;
+
+  // ── Step1: 全ベルトタイルのアイテムのprogressを進める ──────────────
+  for (let r = 0; r < gridSize; r++) {
+    for (let c = 0; c < gridSize; c++) {
+      const t = newGrid[r][c];
+      if ((t.kind === "belt" || t.kind === "assembler") && t.beltItem) {
+        t.beltItem.progress = Math.min(1.0, t.beltItem.progress + beltSpeed * dt);
       }
     }
   }
 
-  return {
-    tick:    newTick,
-    dayPhase,
-    powerUsed,
-    powerMax,
-    batteryCharge,
-    batteryMax: battMax,
-    grid:    newGrid,
-    money:   state.money + moneyFromHub,
-    stone:   state.stone + stonePlus,
-    iron:    state.iron  + ironPlus,
-  };
+  // ── Step2: progress >= 1.0 のアイテムを次のタイルへ移動 ─────────────
+  // 処理順序: 出荷ハブに近い順（またはベルト方向の終端から）に処理することで
+  // デッドロックを防ぐ。ここでは単純に全タイルをスキャンする。
+  for (let r = 0; r < gridSize; r++) {
+    for (let c = 0; c < gridSize; c++) {
+      const t = newGrid[r][c];
+      if (t.kind !== "belt" && t.kind !== "assembler") continue;
+      if (!t.beltItem || t.beltItem.progress < 1.0) continue;
+
+      // 次のタイルの座標を取得
+      const next = getNeighbor(r, c, t.direction, gridSize);
+      if (!next) {
+        // グリッド外 → アイテムを消滅（壁）
+        t.beltItem = null;
+        continue;
+      }
+      const [nr, nc] = next;
+      const nextTile = newGrid[nr][nc];
+
+      if (nextTile.kind === "hub") {
+        // ── ハブに到達: 即時売却 ──────────────────────────────────────
+        const item = t.beltItem;
+        earnedMoney += SELL_RATES[item.kind] ?? 0;
+        if (item.kind === "stone") shippedStone++;
+        if (item.kind === "iron")  shippedIron++;
+        if (item.kind === "gear")  shippedGear++;
+        t.beltItem = null;
+      } else if (nextTile.kind === "belt" && nextTile.beltItem === null) {
+        // ── 次のベルトが空き: 移動 ──────────────────────────────────
+        nextTile.beltItem = { kind: t.beltItem.kind, progress: 0.0 };
+        t.beltItem = null;
+      } else if (nextTile.kind === "assembler" && nextTile.beltItem === null) {
+        // ── 組立機の入口: 素材を受け取る（組立機内処理はtickAssemblerで行う）
+        nextTile.beltItem = { kind: t.beltItem.kind, progress: 0.0 };
+        t.beltItem = null;
+      } else {
+        // ── ボトルネック: 前が詰まっているので進めない ──────────────
+        // progress を 1.0 のままキープ（ライン停止）
+      }
+    }
+  }
+
+  return { newGrid, earnedMoney, shippedStone, shippedIron, shippedGear };
 }
 
-// ════════════════════════════════════════════════════════════════════
-//  ■ 表示用ユーティリティ
-// ════════════════════════════════════════════════════════════════════
+// ─── ドリルの生産処理 ────────────────────────────────────────────────
 
-/** 数値を K / M 表記にフォーマットする */
-export function fmt(n: number): string {
-  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
-  if (n >= 1_000)     return (n / 1_000).toFixed(1) + "K";
-  return Math.floor(n).toString();
+/**
+ * ドリルタイルの生産タイマーを進め、アイテムを排出する。
+ * アイテムは前方のベルトに排出される。前方が詰まっていれば生産停止。
+ *
+ * @returns 更新後のグリッド
+ */
+export function tickDrills(
+  state: GameState,
+  newGrid: Tile[][],
+  dt: number,
+  efficiency: number
+): Tile[][] {
+  const { gridSize, upgrades } = state;
+  const drillBonus = upgrades.turbodrillBoost ? 1 : 0;
+
+  for (let r = 0; r < gridSize; r++) {
+    for (let c = 0; c < gridSize; c++) {
+      const t = newGrid[r][c];
+      if (t.kind !== "stone_drill" && t.kind !== "iron_drill") continue;
+
+      const interval = t.kind === "stone_drill" ? DRILL_PRODUCTION_INTERVAL : IRON_DRILL_INTERVAL;
+      const adjustedInterval = Math.max(0.2, interval / (1 + drillBonus * 0.5));
+
+      // 前方のタイル（排出先）を確認
+      const next = getNeighbor(r, c, t.direction, gridSize);
+      if (!next) continue;
+      const [nr, nc] = next;
+      const frontTile = newGrid[nr][nc];
+
+      // 前方が詰まっていればタイマーを進めない（ボトルネック）
+      const isFrontFull =
+        frontTile.beltItem !== null &&
+        frontTile.kind !== "hub" &&
+        frontTile.kind !== "empty";
+      if (isFrontFull) continue;
+
+      // 鉱床の残量チェック
+      if (t.depositRemaining <= 0) continue;
+
+      // タイマーを進める
+      t.productionTimer += dt * efficiency;
+
+      if (t.productionTimer >= adjustedInterval) {
+        t.productionTimer -= adjustedInterval;
+
+        const itemKind: ItemKind = t.kind === "stone_drill" ? "stone" : "iron";
+
+        // Hubに直接排出
+        if (frontTile.kind === "hub") {
+          // ハブには直接売却しない（ベルト経由のみ）
+          // ハブが隣ならベルト不要で排出可能にする
+        } else if (frontTile.kind === "belt" && frontTile.beltItem === null) {
+          frontTile.beltItem = { kind: itemKind, progress: 0.0 };
+          t.depositRemaining--;
+        }
+        // front がhubなら直接売却（ベルトなし短絡）は仕様外なので何もしない
+      }
+    }
+  }
+
+  return newGrid;
+}
+
+// ─── 組立機の生産処理 ────────────────────────────────────────────────
+
+/**
+ * 組立機の生産タイマーを進め、歯車を生産する。
+ *
+ * 組立機の動作:
+ * 1. 自身のbeltItemを内部バッファとして使う。
+ * 2. 隣接するベルトから石と鉄を吸い込む（インプット）。
+ * 3. 素材が揃ったらタイマーを進め、完成したら前方ベルトへ排出。
+ *
+ * @returns 更新後のグリッド
+ */
+export function tickAssemblers(
+  state: GameState,
+  newGrid: Tile[][],
+  dt: number,
+  efficiency: number
+): { grid: Tile[][]; stonesConsumed: number; ironConsumed: number } {
+  const { gridSize } = state;
+  let stonesConsumed = 0;
+  let ironConsumed = 0;
+
+  for (let r = 0; r < gridSize; r++) {
+    for (let c = 0; c < gridSize; c++) {
+      const t = newGrid[r][c];
+      if (t.kind !== "assembler") continue;
+
+      // 組立機の内部バッファとしてbeltItemを流用
+      // beltItem.kind === "gear" かつ progress >= 1.0 で排出準備完了
+      if (t.beltItem && t.beltItem.kind === "gear") {
+        // 排出待ち: 前方ベルトが空きなら排出
+        const next = getNeighbor(r, c, t.direction, gridSize);
+        if (next) {
+          const [nr, nc] = next;
+          const frontTile = newGrid[nr][nc];
+          if (frontTile.kind === "hub") {
+            // ハブへ直接排出しない（ベルト経由とする）
+          } else if (frontTile.kind === "belt" && frontTile.beltItem === null) {
+            frontTile.beltItem = { kind: "gear", progress: 0.0 };
+            t.beltItem = null;
+          }
+        }
+        continue;
+      }
+
+      // 素材の受け取り（隣接するベルトからスキャン）
+      // beltItemに石や鉄が入ってきたらバッファに吸収する
+      // 実際は tickBeltPhysics で既に beltItem に入っているのでそれを使う
+
+      // 内部素材バッファを使う（組立機はbeltItemを内部バッファに転用しない）
+      // ここではシンプルに: gameState の stone/iron を消費して生産する方式に切り替える
+      // (完全物理物流はベルトに任せ、組立機はグローバルストックから消費)
+      // ← このコメントは設計意図の記録
+
+      // タイマーを進める
+      t.productionTimer += dt * efficiency;
+      if (t.productionTimer >= ASSEMBLER_INTERVAL) {
+        t.productionTimer -= ASSEMBLER_INTERVAL;
+        // 素材消費フラグを立てる（返り値経由でgameStateに反映）
+        stonesConsumed += GEAR_RECIPE.stone;
+        ironConsumed += GEAR_RECIPE.iron;
+
+        // 前方ベルトへ歯車を排出
+        const next = getNeighbor(r, c, t.direction, gridSize);
+        if (next) {
+          const [nr, nc] = next;
+          const frontTile = newGrid[nr][nc];
+          if (frontTile.kind === "belt" && frontTile.beltItem === null) {
+            frontTile.beltItem = { kind: "gear", progress: 0.0 };
+          } else if (frontTile.kind === "hub") {
+            // ハブに直接排出（歯車）→ tickBeltPhysicsで売却される
+            // ここでは何もしない
+          }
+        }
+      }
+    }
+  }
+
+  return { grid: newGrid, stonesConsumed, ironConsumed };
+}
+
+// ─── 昼夜サイクル ────────────────────────────────────────────────────
+
+/**
+ * 昼夜サイクルのタイマーを更新する。
+ * @returns { dayPhase, phaseTimer }
+ */
+export function tickDayNight(
+  dayPhase: "day" | "night",
+  phaseTimer: number,
+  dt: number
+): { dayPhase: "day" | "night"; phaseTimer: number; phaseChanged: boolean } {
+  const duration = dayPhase === "day" ? DAY_DURATION : NIGHT_DURATION;
+  const newTimer = phaseTimer + dt;
+  if (newTimer >= duration) {
+    return {
+      dayPhase: dayPhase === "day" ? "night" : "day",
+      phaseTimer: newTimer - duration,
+      phaseChanged: true,
+    };
+  }
+  return { dayPhase, phaseTimer: newTimer, phaseChanged: false };
+}
+
+// ─── 鉱床の再発見 ────────────────────────────────────────────────────
+
+let depositRespawnTimer = 0;
+
+/**
+ * ランダムな空きマスに新たな鉱床を出現させる。
+ * @returns 更新後のグリッドと鉱床追加フラグ
+ */
+export function tickDepositRespawn(
+  grid: Tile[][],
+  gridSize: number,
+  dt: number
+): { grid: Tile[][]; spawned: boolean; kind: "stone" | "iron" | null } {
+  depositRespawnTimer += dt;
+  if (depositRespawnTimer < DEPOSIT_RESPAWN_INTERVAL) {
+    return { grid, spawned: false, kind: null };
+  }
+  depositRespawnTimer -= DEPOSIT_RESPAWN_INTERVAL;
+
+  // 空きマス（empty）をリストアップ
+  const empties: [number, number][] = [];
+  for (let r = 0; r < gridSize; r++) {
+    for (let c = 0; c < gridSize; c++) {
+      if (grid[r][c].kind === "empty") empties.push([r, c]);
+    }
+  }
+  if (empties.length === 0) return { grid, spawned: false, kind: null };
+
+  const [tr, tc] = empties[Math.floor(Math.random() * empties.length)];
+  const kind = Math.random() < 0.6 ? "stone" : "iron";
+  const newGrid = grid.map(row => row.map(t => ({ ...t })));
+  newGrid[tr][tc] = {
+    ...newGrid[tr][tc],
+    kind: kind === "stone" ? "stone_deposit" : "iron_deposit",
+    depositRemaining: kind === "stone" ? 500 : 300,
+  };
+
+  return { grid: newGrid, spawned: true, kind };
+}
+
+// ─── グリッド初期化 ──────────────────────────────────────────────────
+
+/** 指定サイズのグリッドを初期化する */
+export function createGrid(size: number, prevGrid?: Tile[][]): Tile[][] {
+  const grid: Tile[][] = [];
+  for (let r = 0; r < size; r++) {
+    const row: Tile[] = [];
+    for (let c = 0; c < size; c++) {
+      // 既存グリッドのデータを引き継ぐ（拡張時）
+      if (prevGrid && r < prevGrid.length && c < prevGrid[r].length) {
+        row.push(prevGrid[r][c]);
+      } else {
+        row.push({
+          id: `tile_${r}_${c}`,
+          kind: "empty",
+          direction: "right",
+          beltItem: null,
+          productionTimer: 0,
+          depositRemaining: 0,
+        });
+      }
+    }
+    grid.push(row);
+  }
+  return grid;
+}
+
+/** ゲームの初期グリッドを生成（鉱床・ハブを配置） */
+export function createInitialGrid(size: number): Tile[][] {
+  const grid = createGrid(size);
+  const hubR = Math.floor(size / 2);
+  const hubC = Math.floor(size / 2);
+
+  // ハブを配置（中央）
+  grid[hubR][hubC] = {
+    id: `tile_${hubR}_${hubC}`,
+    kind: "hub",
+    direction: "right",
+    beltItem: null,
+    productionTimer: 0,
+    depositRemaining: 0,
+  };
+
+  // 石鉱床
+  const stonePositions: [number, number][] = [
+    [0, 0], [0, size - 1], [1, 2], [3, 1], [size - 1, size - 2],
+  ];
+  stonePositions.forEach(([r, c]) => {
+    if (r < size && c < size && !(r === hubR && c === hubC)) {
+      grid[r][c] = {
+        id: `tile_${r}_${c}`,
+        kind: "stone_deposit",
+        direction: "right",
+        beltItem: null,
+        productionTimer: 0,
+        depositRemaining: 500,
+      };
+    }
+  });
+
+  // 鉄鉱床
+  const ironPositions: [number, number][] = [
+    [0, 2], [2, size - 1], [size - 1, 0], [size - 2, size - 2],
+  ];
+  ironPositions.forEach(([r, c]) => {
+    if (r < size && c < size && !(r === hubR && c === hubC)) {
+      grid[r][c] = {
+        id: `tile_${r}_${c}`,
+        kind: "iron_deposit",
+        direction: "right",
+        beltItem: null,
+        productionTimer: 0,
+        depositRemaining: 300,
+      };
+    }
+  });
+
+  return grid;
+}
+
+// ─── グリッド拡張 ────────────────────────────────────────────────────
+
+/**
+ * 既存グリッドを新しいサイズに拡張する。
+ * 既存タイルはそのまま保持し、新しいタイルは empty で埋める。
+ * 新しいサイズが奇数であれば中央は常にハブが来るよう調整する。
+ */
+export function expandGrid(prevGrid: Tile[][], newSize: number): Tile[][] {
+  const expanded = createGrid(newSize, prevGrid);
+  // 既存のハブ位置を確認（新しい中央に移動しない）
+  // ハブは元の位置のまま保持する（引き継ぎで対応済み）
+  return expanded;
+}
+
+// ─── ロケット打ち上げ条件チェック ─────────────────────────────────────
+
+export function checkRocketReady(
+  money: number,
+  totalGearsShipped: number,
+  totalIronShipped: number
+): boolean {
+  return (
+    money >= ROCKET_REQUIREMENTS.money &&
+    totalGearsShipped >= ROCKET_REQUIREMENTS.gear &&
+    totalIronShipped >= ROCKET_REQUIREMENTS.iron
+  );
+}
+
+// ─── 統計スナップショット ─────────────────────────────────────────────
+
+/** 最大10件の統計履歴を管理する */
+export function pushSnapshot(
+  history: import("../types").StatsSnapshot[],
+  snap: import("../types").StatsSnapshot
+): import("../types").StatsSnapshot[] {
+  const next = [...history, snap];
+  if (next.length > 10) next.shift();
+  return next;
 }

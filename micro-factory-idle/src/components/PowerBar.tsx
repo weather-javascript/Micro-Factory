@@ -1,86 +1,102 @@
 // ════════════════════════════════════════════════════════════════════
-//  components/PowerBar.tsx — 電力メーター + 蓄電池残量
+//  components/PowerBar.tsx — 電力消費・蓄電量の視覚化バー
 // ════════════════════════════════════════════════════════════════════
 
+import React from "react";
 
-import type React from "react";
-import { LightningIcon, BatteryIcon } from "./Icons";
-import { fmt } from "../utils/gameLogic";
-
-interface Props {
+interface PowerBarProps {
   used: number;
   max: number;
   batteryCharge: number;
   batteryMax: number;
+  isNight?: boolean;
 }
 
-export const PowerBar: React.FC<Props> = ({ used, max, batteryCharge, batteryMax }) => {
-  const pct      = max === 0 ? 0 : Math.min(100, (used / max) * 100);
-  const overload = used > max && max > 0;
-  const barColor = overload ? "#FC8181" : pct > 75 ? "#FBBF24" : "#4ade80";
-  const battPct  = batteryMax === 0 ? 0 : Math.min(100, (batteryCharge / batteryMax) * 100);
+export const PowerBar: React.FC<PowerBarProps> = ({
+  used, max, batteryCharge, batteryMax, isNight = false,
+}) => {
+  // 電力充足率（0〜1）
+  const powerRatio = max <= 0 ? 0 : Math.min(1, used / max);
+  // 蓄電率（0〜1）
+  const battRatio = batteryMax <= 0 ? 0 : Math.min(1, batteryCharge / batteryMax);
+
+  const isOverloaded = used > max;
+  const isNearOverload = used / max > 0.85;
+
+  const powerColor = isOverloaded
+    ? "#FC8181"
+    : isNearOverload
+    ? "#FBD38D"
+    : "#4ade80";
 
   return (
     <div
-      className="flex flex-col gap-1.5 rounded-xl px-3 py-2"
-      style={{
-        background: "#20202a",
-        border: `1px solid ${overload ? "#FC818144" : "#4ade8020"}`,
-      }}
+      className="rounded-xl px-3 py-2"
+      style={{ background: "#1a1a24", border: "1px solid #22222e" }}
     >
-      {/* 電力メーター */}
-      <div className="flex items-center gap-2">
-        <LightningIcon className="w-4 h-4 shrink-0" />
-        <div className="flex-1">
-          <div className="flex justify-between text-[10px] mb-1">
-            <span
-              className="font-bold tracking-widest uppercase"
-              style={{ color: overload ? "#FC8181" : "#4ade80" }}
-            >
-              電力{overload ? " ⚠ 不足" : ""}
+      {/* 電力ライン */}
+      <div className="flex items-center justify-between mb-1.5">
+        <span className="text-[10px] font-bold tracking-wider" style={{ color: "#555" }}>
+          ⚡ 電力
+        </span>
+        <span
+          className="text-[11px] font-bold tabular-nums"
+          style={{ color: powerColor }}
+        >
+          {used}W / {max}W
+          {isOverloaded && (
+            <span className="ml-1 text-[10px]" style={{ color: "#FC8181" }}>
+              電力不足！
             </span>
-            <span style={{ color: barColor }}>
-              {used}W / {max}W
+          )}
+        </span>
+      </div>
+
+      {/* 電力バー */}
+      <div
+        className="w-full h-2 rounded-full overflow-hidden mb-2"
+        style={{ background: "#252532" }}
+      >
+        <div
+          className="h-full rounded-full transition-all duration-300"
+          style={{
+            width: `${Math.min(100, powerRatio * 100)}%`,
+            background: isOverloaded
+              ? "linear-gradient(90deg, #FC8181, #FCA5A5)"
+              : `linear-gradient(90deg, ${powerColor}80, ${powerColor})`,
+            boxShadow: `0 0 6px ${powerColor}60`,
+          }}
+        />
+      </div>
+
+      {/* 蓄電池ライン（蓄電池がある場合のみ） */}
+      {batteryMax > 0 && (
+        <>
+          <div className="flex items-center justify-between mb-1">
+            <span className="text-[10px] font-bold tracking-wider" style={{ color: "#555" }}>
+              🔋 蓄電池
+            </span>
+            <span className="text-[11px] font-bold tabular-nums" style={{ color: "#a78bfa" }}>
+              {Math.floor(batteryCharge)}Wh / {batteryMax}Wh
+              <span className="ml-1 text-[10px]" style={{ color: "#a78bfa80" }}>
+                {isNight ? "（放電中）" : "（充電中）"}
+              </span>
             </span>
           </div>
-          <div className="w-full h-1.5 rounded-full" style={{ background: "#2a2a36" }}>
+          <div
+            className="w-full h-1.5 rounded-full overflow-hidden"
+            style={{ background: "#252532" }}
+          >
             <div
-              className="h-1.5 rounded-full transition-all duration-500"
+              className="h-full rounded-full transition-all duration-500"
               style={{
-                width: `${pct}%`,
-                background: barColor,
-                boxShadow: `0 0 6px ${barColor}88`,
+                width: `${battRatio * 100}%`,
+                background: "linear-gradient(90deg, #6d28d9, #a78bfa)",
+                boxShadow: battRatio > 0 ? "0 0 4px #a78bfa60" : "none",
               }}
             />
           </div>
-        </div>
-      </div>
-
-      {/* 蓄電池残量（蓄電池が1台以上あるとき表示） */}
-      {batteryMax > 0 && (
-        <div className="flex items-center gap-2">
-          <BatteryIcon className="w-4 h-4 shrink-0" />
-          <div className="flex-1">
-            <div className="flex justify-between text-[10px] mb-1">
-              <span className="font-bold tracking-widest uppercase" style={{ color: "#7c3aed" }}>
-                蓄電池
-              </span>
-              <span style={{ color: "#a78bfa" }}>
-                {fmt(batteryCharge)} / {fmt(batteryMax)} Wh
-              </span>
-            </div>
-            <div className="w-full h-1.5 rounded-full" style={{ background: "#2a2a36" }}>
-              <div
-                className="h-1.5 rounded-full transition-all duration-700"
-                style={{
-                  width: `${battPct}%`,
-                  background: "#7c3aed",
-                  boxShadow: "0 0 6px #7c3aed88",
-                }}
-              />
-            </div>
-          </div>
-        </div>
+        </>
       )}
     </div>
   );

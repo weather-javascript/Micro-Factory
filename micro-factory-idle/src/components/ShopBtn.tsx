@@ -1,51 +1,74 @@
 // ════════════════════════════════════════════════════════════════════
-//  components/ShopBtn.tsx — ショップの施設選択ボタン
+//  components/ShopBtn.tsx — ショップボタン
 // ════════════════════════════════════════════════════════════════════
 
+import React from "react";
 
-import type React from "react";
-import { CoinIcon } from "./Icons";
-
-interface Props {
-  /** 識別用キー */
+interface ShopBtnProps {
   item: string;
   label: string;
-  /** 購入コスト（nullなら無料表示） */
   cost: number | null;
   icon: React.ReactNode;
   accent: string;
   selected: boolean;
   canAfford: boolean;
   onSelect: () => void;
-  /** ボタン下部の補足テキスト */
   sublabel?: string;
+  locked?: boolean;
 }
 
-export const ShopBtn: React.FC<Props> = ({
-  label, cost, icon, accent, selected, canAfford, onSelect, sublabel,
-}) => (
-  <button
-    onClick={onSelect}
-    className="flex-1 flex flex-col items-center gap-1 py-2 px-1 rounded-xl text-xs font-bold transition-all duration-150 active:scale-95"
-    style={{
-      background: selected ? `${accent}28` : "#20202a",
-      border:     `1.5px solid ${selected ? accent : "#2e2e3a"}`,
-      color:      canAfford ? accent : "#444",
-      boxShadow:  selected ? `0 0 14px ${accent}38` : "none",
-    }}
-  >
-    {icon}
-    <span style={{ fontSize: "10px", lineHeight: 1.2 }}>{label}</span>
-    {sublabel && (
-      <span style={{ fontSize: "9px", color: "#555" }}>{sublabel}</span>
-    )}
-    {cost !== null ? (
-      <span className="flex items-center gap-0.5" style={{ color: canAfford ? "#F5C842" : "#444" }}>
-        <CoinIcon className="w-3 h-3" />
-        {cost}
+export const ShopBtn: React.FC<ShopBtnProps> = ({
+  label, cost, icon, accent, selected, canAfford, onSelect, sublabel, locked = false,
+}) => {
+  const isDisabled = !canAfford || locked;
+
+  return (
+    <button
+      onClick={onSelect}
+      disabled={locked}
+      className="flex-1 flex flex-col items-center justify-center gap-0.5 rounded-xl py-2 px-1 transition-all duration-150 relative"
+      style={{
+        background: selected
+          ? `${accent}20`
+          : locked
+          ? "#111118"
+          : isDisabled
+          ? "#14141c"
+          : "#1a1a24",
+        border: `1px solid ${selected ? accent : locked ? "#222" : isDisabled ? "#252530" : accent + "50"}`,
+        color: selected ? accent : locked ? "#333" : isDisabled ? "#444" : accent,
+        opacity: locked ? 0.5 : 1,
+        transform: selected ? "scale(0.97)" : "scale(1)",
+        boxShadow: selected ? `0 0 8px ${accent}40` : "none",
+      }}
+    >
+      {locked && (
+        <div
+          className="absolute top-1 right-1 text-[9px]"
+          style={{ color: "#555" }}
+        >
+          🔒
+        </div>
+      )}
+      <span style={{ opacity: locked ? 0.4 : 1 }}>{icon}</span>
+      <span className="text-[9px] font-bold leading-none" style={{ opacity: locked ? 0.4 : 1 }}>
+        {label}
       </span>
-    ) : (
-      <span style={{ fontSize: "9px", color: "#FC8181" }}>無料</span>
-    )}
-  </button>
-);
+      {cost !== null ? (
+        <span
+          className="text-[9px] tabular-nums font-medium"
+          style={{
+            color: selected ? accent + "cc" : isDisabled ? "#333" : accent + "80",
+          }}
+        >
+          {cost}¥
+        </span>
+      ) : null}
+      {sublabel && (
+        <span className="text-[8px]" style={{ color: "#44444e", opacity: locked ? 0.4 : 1 }}>
+          {sublabel}
+        </span>
+      )}
+    </button>
+  );
+};
