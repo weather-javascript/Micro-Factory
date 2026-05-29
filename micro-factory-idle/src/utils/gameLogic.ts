@@ -1,613 +1,600 @@
 // ════════════════════════════════════════════════════════════════════
-//  utils/gameLogic.ts — ゲームのコアロジック（純粋関数）
-//  ゲームループ内で毎フレーム呼び出される物理物流・生産計算を担当。
+//  utils/gameLogic.ts — Micro-Factory 3D ゲームコアロジック
 // ════════════════════════════════════════════════════════════════════
 
-import type { GameState, Tile, Direction, ItemKind, BeltItem } from "../types";
+import type {
+  GameState, Tile, Direction, ItemKind,
+  ProdStats, StatsSnapshot, DayPhase,
+} from "../types";
 import {
-  HUB_ROW, HUB_COL,
-  BELT_SPEED, FAST_BELT_SPEED,
-  DRILL_PRODUCTION_INTERVAL, IRON_DRILL_INTERVAL,
-  ASSEMBLER_INTERVAL, GEAR_RECIPE,
-  SELL_RATES, POWER_CONSUMPTION, LOW_POWER_EFFICIENCY,
-  DAY_DURATION, NIGHT_DURATION,
-  SOLAR_POWER, BATTERY_CAPACITY, LARGE_BATTERY_MULTIPLIER,
-  DEPOSIT_RESPAWN_INTERVAL, INITIAL_STONE_DEPOSITS,
+  STONE_DRILL_INTERVAL, IRON_DRILL_INTERVAL, URANIUM_DRILL_INTERVAL,
+  ASSEMBLER_INTERVAL, FUEL_ROD_INTERVAL,
+  BELT_SPEED_NORMAL, BELT_SPEED_FAST,
+  SOLAR_POWER_DAY, STEAM_ENGINE_POWER, NUCLEAR_POWER,
+  BATTERY_CAPACITY, LARGE_BATTERY_MULT, LOW_POWER_EFFICIENCY,
+  POWER_CONSUMPTION,
+  GEAR_RECIPE, FUEL_ROD_RECIPE,
+  WASTE_CHANCE_NORMAL, WASTE_CHANCE_PROD,
+  SELL_RATES, PHASE_DURATIONS,
+  DEPOSIT_RESPAWN_SECS,
+  TILE_SIZE,
   ROCKET_REQUIREMENTS,
 } from "../constants";
-import type { ProdStats, StatsSnapshot } from "../types";
+
+// ─── モジュール倍率（constants.tsに未定義のためここで宣言） ──────────
+const _MODULE_SPEED_MULT = 1.5;
+const _MODULE_PROD_MULT  = 2.0;
 
 // ─── 数値フォーマット ─────────────────────────────────────────────────
-
-/** 数値を見やすい形式に変換（例: 1200 → 1.2k） */
 export function fmt(n: number): string {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
   if (n >= 10_000)    return (n / 1_000).toFixed(1) + "k";
   return Math.floor(n).toString();
 }
 
-// ─── 隣接タイル取得 ──────────────────────────────────────────────────
+// ─── タイル座標 → 3D世界座標 ────────────────────────────────────────
+export function tileToWorld(row: number, col: number, gridSize: number): [number, number, number] {
+  const offset = (gridSize - 1) / 2;
+  return [
+    (col - offset) * TILE_SIZE,
+    0,
+    (row - offset) * TILE_SIZE,
+  ];
+}
 
-/** 指定方向の隣接マスの座標を返す */
+// ─── 方向ユーティリティ ──────────────────────────────────────────────
 export function getNeighbor(
-  row: number, col: number, dir: Direction, gridSize: number
+  row: number, col: number, dir: Direction, gridSize: number,
 ): [number, number] | null {
-  const deltas: Record<Direction, [number, number]> = {
-    up:    [-1,  0],
-    right: [ 0,  1],
-    down:  [ 1,  0],
-    left:  [ 0, -1],
+  const d: Record<Direction, [number, number]> = {
+    up: [-1, 0], right: [0, 1], down: [1, 0], left: [0, -1],
   };
-  const [dr, dc] = deltas[dir];
-  const nr = row + dr;
-  const nc = col + dc;
+  const [dr, dc] = d[dir];
+  const nr = row + dr, nc = col + dc;
   if (nr < 0 || nr >= gridSize || nc < 0 || nc >= gridSize) return null;
   return [nr, nc];
 }
 
-/** 指定方向からの反対方向（入口判定に使用） */
-export function opposite(dir: Direction): Direction {
-  const map: Record<Direction, Direction> = {
-    up: "down", down: "up", left: "right", right: "left",
-  };
-  return map[dir];
-}
-
 // ─── 電力計算 ────────────────────────────────────────────────────────
-
-/**
- * 現在の電力状況を計算する。
- * ソーラーは昼のみ発電。蓄電池は夜に放電、昼に充電。
- */
 export function calcPower(state: GameState): {
-  powerUsed: number;
-  powerMax: number;
-  batteryCharge: number;
-  batteryMax: number;
-  efficiency: number;
+  powerUsed:      number;
+  powerGenerated: number;
+  batteryMax:     number;
+  efficiency:     number;
 } {
   const { grid, gridSize, dayPhase, upgrades } = state;
-  let used = 0;
-  let solar = 0;
-  let batteryCnt = 0;
+  let used = 0, solar = 0, steam = 0, nuclear = 0, batteryCnt = 0;
 
   for (let r = 0; r < gridSize; r++) {
     for (let c = 0; c < gridSize; c++) {
       const t = grid[r][c];
-      const pw = POWER_CONSUMPTION[t.kind];
-      if (pw) used += pw;
-      if (t.kind === "solar") solar += SOLAR_POWER;
-      if (t.kind === "battery") batteryCnt++;
+      let pw = POWER_CONSUMPTION[t.kind] ?? 0;
+      if (
+        (t.kind === "stone_drill" || t.kind === "iron_drill" ||
+         t.kind === "uranium_drill" || t.kind === "assembler") &&
+        t.module === "speed"
+      ) pw *= 2.0;
+      used += pw;
+      if (t.kind === "solar")                             solar++;
+      if (t.kind === "battery")                           batteryCnt++;
+      if (t.kind === "steam_engine"  && t.waterFed)       steam   += STEAM_ENGINE_POWER;
+      if (t.kind === "nuclear_plant" && t.fuelFed)        nuclear += NUCLEAR_POWER;
     }
   }
 
-  const isDay = dayPhase === "day";
-  // 昼はソーラー発電、夜は0
-  const solarOutput = isDay ? solar : 0;
+  const solarMult  = dayPhase === "day" ? 1.0 : dayPhase === "dusk" ? 0.5 : dayPhase === "dawn" ? 0.3 : 0;
+  const solarOut   = solar * SOLAR_POWER_DAY * solarMult;
+  const battMult   = upgrades.largeBattery ? LARGE_BATTERY_MULT : 1;
+  // ★修正: battMax → batteryMax に統一
+  const batteryMax = batteryCnt * BATTERY_CAPACITY * battMult;
+  const generated  = solarOut + steam + nuclear;
+  const available  = generated + Math.min(state.batteryCharge, Math.max(0, used - generated));
+  const efficiency = used <= 0 ? 1.0 : available >= used ? 1.0 : LOW_POWER_EFFICIENCY;
 
-  const battMult = upgrades.largeBattery ? LARGE_BATTERY_MULTIPLIER : 1;
-  const battMax = batteryCnt * BATTERY_CAPACITY * battMult;
-
-  // 実際に利用できる電力 = ソーラー + 蓄電池放電（夜のみ）
-  const availablePower = isDay
-    ? solarOutput
-    : solarOutput + Math.min(state.batteryCharge, used); // 夜は蓄電池から補う
-
-  const totalAvailable = isDay ? solarOutput : availablePower;
-  const efficiency = used <= 0 ? 1.0 : Math.min(1.0, totalAvailable / used) < LOW_POWER_EFFICIENCY
-    ? LOW_POWER_EFFICIENCY
-    : Math.min(1.0, used <= totalAvailable ? 1.0 : LOW_POWER_EFFICIENCY);
-
-  return {
-    powerUsed: used,
-    powerMax: isDay ? solar : state.batteryCharge,
-    batteryCharge: state.batteryCharge,
-    batteryMax: battMax,
-    efficiency: (used === 0 || totalAvailable >= used) ? 1.0 : LOW_POWER_EFFICIENCY,
-  };
+  return { powerUsed: used, powerGenerated: generated, batteryMax, efficiency };
 }
 
-// ─── 蓄電池の充放電 ──────────────────────────────────────────────────
-
-/**
- * 1ティック（dt秒）分の蓄電池充放電を計算する。
- * 昼: 余剰電力を充電。夜: 消費電力を放電。
- * @returns 更新後の batteryCharge
- */
-export function updateBattery(state: GameState, dt: number): number {
-  const { dayPhase, powerUsed, upgrades } = state;
-  const { grid, gridSize } = state;
-
+// ─── 蓄電池充放電 ────────────────────────────────────────────────────
+export function updateBattery(
+  state: GameState, dt: number, batteryMax: number,
+): number {
+  const { powerUsed, dayPhase, grid, gridSize } = state;
   let solar = 0;
-  let batteryCnt = 0;
-  for (let r = 0; r < gridSize; r++) {
+  for (let r = 0; r < gridSize; r++)
+    for (let c = 0; c < gridSize; c++)
+      if (grid[r][c].kind === "solar") solar += SOLAR_POWER_DAY;
+
+  const solarMult = dayPhase === "day" ? 1.0 : dayPhase === "dusk" ? 0.5 : dayPhase === "dawn" ? 0.3 : 0;
+  const solarOut  = solar * solarMult;
+  let steamNuclear = 0;
+  for (let r = 0; r < gridSize; r++)
     for (let c = 0; c < gridSize; c++) {
       const t = grid[r][c];
-      if (t.kind === "solar") solar += SOLAR_POWER;
-      if (t.kind === "battery") batteryCnt++;
+      if (t.kind === "steam_engine"  && t.waterFed) steamNuclear += STEAM_ENGINE_POWER;
+      if (t.kind === "nuclear_plant" && t.fuelFed)  steamNuclear += NUCLEAR_POWER;
     }
-  }
 
-  const battMult = upgrades.largeBattery ? LARGE_BATTERY_MULTIPLIER : 1;
-  const battMax = batteryCnt * BATTERY_CAPACITY * battMult;
-
-  if (dayPhase === "day") {
-    // 余剰電力を充電（ソーラー - 消費）
-    const surplus = Math.max(0, solar - powerUsed);
-    return Math.min(battMax, state.batteryCharge + surplus * dt);
+  const generated = solarOut + steamNuclear;
+  if (generated >= powerUsed) {
+    const surplus = generated - powerUsed;
+    return Math.min(batteryMax, state.batteryCharge + surplus * dt);
   } else {
-    // 夜: 消費分を放電
-    return Math.max(0, state.batteryCharge - powerUsed * dt);
+    const deficit = powerUsed - generated;
+    return Math.max(0, state.batteryCharge - deficit * dt);
   }
 }
 
-// ─── 生産統計の集計 ──────────────────────────────────────────────────
-
-/** グリッドから生産統計を集計する */
+// ─── 生産統計 ────────────────────────────────────────────────────────
 export function calcProdStats(state: GameState): ProdStats {
-  const { grid, gridSize, upgrades, dayPhase } = state;
-  let stoneDrillCnt = 0;
-  let ironDrillCnt = 0;
-  let beltCnt = 0;
-  let solarCnt = 0;
-  let batteryCnt = 0;
-  let assemblerCnt = 0;
+  const { grid, gridSize, upgrades, ngPlusBuff } = state;
+  let stoneDrillCnt = 0, ironDrillCnt = 0, uraniumDrillCnt = 0;
+  let beltCnt = 0, solarCnt = 0, batteryCnt = 0, assemblerCnt = 0;
+  let waterPumpCnt = 0, steamEngineCnt = 0, nuclearPlantCnt = 0, wasteDisposalCnt = 0;
 
-  for (let r = 0; r < gridSize; r++) {
-    for (let c = 0; c < gridSize; c++) {
-      const k = grid[r][c].kind;
-      if (k === "stone_drill") stoneDrillCnt++;
-      else if (k === "iron_drill") ironDrillCnt++;
-      else if (k === "belt") beltCnt++;
-      else if (k === "solar") solarCnt++;
-      else if (k === "battery") batteryCnt++;
-      else if (k === "assembler") assemblerCnt++;
-    }
-  }
+  for (let r = 0; r < gridSize; r++)
+    for (let c = 0; c < gridSize; c++)
+      switch (grid[r][c].kind) {
+        case "stone_drill":    stoneDrillCnt++;    break;
+        case "iron_drill":     ironDrillCnt++;     break;
+        case "uranium_drill":  uraniumDrillCnt++;  break;
+        case "belt":           beltCnt++;          break;
+        case "solar":          solarCnt++;         break;
+        case "battery":        batteryCnt++;       break;
+        case "assembler":      assemblerCnt++;     break;
+        case "water_pump":     waterPumpCnt++;     break;
+        case "steam_engine":   steamEngineCnt++;   break;
+        case "nuclear_plant":  nuclearPlantCnt++;  break;
+        case "waste_disposal": wasteDisposalCnt++; break;
+      }
 
-  const { efficiency } = calcPower(state);
-  const drillBonus = upgrades.turbodrillBoost ? 1 : 0;
-  const stonePerSec = Math.floor(
-    stoneDrillCnt * (1 / DRILL_PRODUCTION_INTERVAL + drillBonus) * efficiency
-  );
-  const ironPerSec = Math.floor(
-    ironDrillCnt * (1 / IRON_DRILL_INTERVAL + drillBonus * 0.5) * efficiency
-  );
-
-  // 収入/秒は歯車ベルト出荷による概算
-  const incomePerSec = 0;
+  const { efficiency, powerUsed, powerGenerated } = calcPower(state);
+  const drillBonus  = upgrades.turbodrillBoost ? 0.5 : 0;
+  const ngProd      = ngPlusBuff.productionMultiplier;
+  const stonePerSec = Math.floor(stoneDrillCnt * (1 / STONE_DRILL_INTERVAL) * (1 + drillBonus) * efficiency * ngProd);
+  const ironPerSec  = Math.floor(ironDrillCnt  * (1 / IRON_DRILL_INTERVAL)  * (1 + drillBonus) * efficiency * ngProd);
 
   return {
-    stoneDrillCnt,
-    ironDrillCnt,
-    beltCnt,
-    solarCnt,
-    batteryCnt,
-    assemblerCnt,
-    stonePerSec,
-    ironPerSec,
-    incomePerSec,
+    stoneDrillCnt, ironDrillCnt, uraniumDrillCnt, beltCnt, solarCnt,
+    batteryCnt, assemblerCnt, waterPumpCnt, steamEngineCnt,
+    nuclearPlantCnt, wasteDisposalCnt,
+    stonePerSec, ironPerSec,
+    powerBalance: powerGenerated - powerUsed,
     efficiency,
   };
 }
 
-// ─── ベルト物流のシミュレーション ────────────────────────────────────
+// ─── 昼夜サイクル ────────────────────────────────────────────────────
+export function tickDayNight(
+  phase: DayPhase, timer: number, dt: number,
+): { dayPhase: DayPhase; phaseTimer: number; lightNorm: number; phaseChanged: boolean } {
+  const dur      = PHASE_DURATIONS[phase];
+  const newTimer = timer + dt;
+  let changed    = false;
+  let nextPhase  = phase;
 
-/**
- * 1ティック分のベルト物流を更新する。
- *
- * アルゴリズム概要:
- * 1. 各タイルのアイテムの progress を belt_speed * dt だけ進める。
- * 2. progress >= 1.0 になったアイテムは「次のタイル」への移動を試みる。
- * 3. 次のタイルが:
- *    - hub → アイテムを売却（money加算）
- *    - belt/assembler（空き）→ 移動
- *    - 詰まっている（occupied）→ 移動をブロック（progress = 1.0でキープ）
- *
- * @returns 更新後のグリッドと獲得コイン・各素材のカウント
- */
+  if (newTimer >= dur) {
+    changed = true;
+    const order: DayPhase[] = ["day", "dusk", "night", "dawn"];
+    const idx = order.indexOf(phase);
+    nextPhase = order[(idx + 1) % 4];
+  }
+
+  const total = PHASE_DURATIONS.day + PHASE_DURATIONS.dusk + PHASE_DURATIONS.night + PHASE_DURATIONS.dawn;
+  const phaseOffsets: Record<DayPhase, number> = {
+    day:   0,
+    dusk:  PHASE_DURATIONS.day,
+    night: PHASE_DURATIONS.day + PHASE_DURATIONS.dusk,
+    dawn:  PHASE_DURATIONS.day + PHASE_DURATIONS.dusk + PHASE_DURATIONS.night,
+  };
+  const elapsed   = phaseOffsets[phase] + Math.min(newTimer, dur);
+  const lightNorm = elapsed / total;
+
+  return {
+    dayPhase:     changed ? nextPhase : phase,
+    phaseTimer:   changed ? newTimer - dur : newTimer,
+    lightNorm,
+    phaseChanged: changed,
+  };
+}
+
+// ─── ベルト物流 ──────────────────────────────────────────────────────
 export function tickBeltPhysics(
-  state: GameState,
-  dt: number
+  state: GameState, dt: number,
 ): {
-  newGrid: Tile[][];
-  earnedMoney: number;
-  shippedStone: number;
-  shippedIron: number;
-  shippedGear: number;
+  newGrid:        Tile[][];
+  earnedMoney:    number;
+  shippedStone:   number;
+  shippedIron:    number;
+  shippedUranium: number;
+  shippedGear:    number;
+  shippedFuel:    number;
+  shippedWaste:   number;
 } {
-  const { grid, gridSize, upgrades } = state;
-  const beltSpeed = upgrades.fastBelt ? FAST_BELT_SPEED : BELT_SPEED;
+  const { grid, gridSize, upgrades, ngPlusBuff } = state;
+  const beltSpeed = upgrades.fastBelt ? BELT_SPEED_FAST : BELT_SPEED_NORMAL;
+  const ngSpeed   = ngPlusBuff.speedMultiplier;
 
-  // グリッドをディープコピー（参照が混入しないように）
-  const newGrid: Tile[][] = grid.map(row =>
+  const ng: Tile[][] = grid.map(row =>
     row.map(t => ({ ...t, beltItem: t.beltItem ? { ...t.beltItem } : null }))
   );
 
-  let earnedMoney = 0;
-  let shippedStone = 0;
-  let shippedIron = 0;
-  let shippedGear = 0;
+  let earnedMoney = 0, shippedStone = 0, shippedIron = 0, shippedUranium = 0;
+  let shippedGear = 0, shippedFuel = 0, shippedWaste = 0;
 
-  // ── Step1: 全ベルトタイルのアイテムのprogressを進める ──────────────
-  for (let r = 0; r < gridSize; r++) {
+  // Step1: progress を進める
+  for (let r = 0; r < gridSize; r++)
     for (let c = 0; c < gridSize; c++) {
-      const t = newGrid[r][c];
-      if ((t.kind === "belt" || t.kind === "assembler") && t.beltItem) {
-        t.beltItem.progress = Math.min(1.0, t.beltItem.progress + beltSpeed * dt);
-      }
+      const t = ng[r][c];
+      if ((t.kind === "belt" || t.kind === "filter") && t.beltItem)
+        t.beltItem.progress = Math.min(1.0, t.beltItem.progress + beltSpeed * ngSpeed * dt);
     }
-  }
 
-  // ── Step2: progress >= 1.0 のアイテムを次のタイルへ移動 ─────────────
-  // 処理順序: 出荷ハブに近い順（またはベルト方向の終端から）に処理することで
-  // デッドロックを防ぐ。ここでは単純に全タイルをスキャンする。
+  // Step2: progress >= 1.0 → 次タイルへ移動
   for (let r = 0; r < gridSize; r++) {
     for (let c = 0; c < gridSize; c++) {
-      const t = newGrid[r][c];
-      if (t.kind !== "belt" && t.kind !== "assembler") continue;
-      if (!t.beltItem || t.beltItem.progress < 1.0) continue;
+      const t         = ng[r][c];
+      const isCarrier = t.kind === "belt" || t.kind === "filter";
+      if (!isCarrier || !t.beltItem || t.beltItem.progress < 1.0) continue;
 
-      // 次のタイルの座標を取得
-      const next = getNeighbor(r, c, t.direction, gridSize);
-      if (!next) {
-        // グリッド外 → アイテムを消滅（壁）
-        t.beltItem = null;
-        continue;
+      // フィルター分配器の出口方向決定
+      let outDir = t.direction;
+      if (t.kind === "filter" && t.beltItem) {
+        const k = t.beltItem.kind as keyof typeof t.filterConfig;
+        if (t.filterConfig[k]) outDir = t.filterConfig[k]!;
       }
-      const [nr, nc] = next;
-      const nextTile = newGrid[nr][nc];
 
-      if (nextTile.kind === "hub") {
-        // ── ハブに到達: 即時売却 ──────────────────────────────────────
+      const next = getNeighbor(r, c, outDir, gridSize);
+      if (!next) { t.beltItem = null; continue; }
+      const [nr, nc] = next;
+      const nxt = ng[nr][nc];
+
+      if (nxt.kind === "hub" || nxt.kind === "space_elevator") {
         const item = t.beltItem;
         earnedMoney += SELL_RATES[item.kind] ?? 0;
-        if (item.kind === "stone") shippedStone++;
-        if (item.kind === "iron")  shippedIron++;
-        if (item.kind === "gear")  shippedGear++;
+        if (item.kind === "stone")    shippedStone++;
+        if (item.kind === "iron")     shippedIron++;
+        if (item.kind === "uranium")  shippedUranium++;
+        if (item.kind === "gear")     shippedGear++;
+        if (item.kind === "fuel_rod") shippedFuel++;
+        if (item.kind === "waste" || item.kind === "radio_waste") shippedWaste++;
         t.beltItem = null;
-      } else if (nextTile.kind === "belt" && nextTile.beltItem === null) {
-        // ── 次のベルトが空き: 移動 ──────────────────────────────────
-        nextTile.beltItem = { kind: t.beltItem.kind, progress: 0.0 };
-        t.beltItem = null;
-      } else if (nextTile.kind === "assembler" && nextTile.beltItem === null) {
-        // ── 組立機の入口: 素材を受け取る（組立機内処理はtickAssemblerで行う）
-        nextTile.beltItem = { kind: t.beltItem.kind, progress: 0.0 };
-        t.beltItem = null;
-      } else {
-        // ── ボトルネック: 前が詰まっているので進めない ──────────────
-        // progress を 1.0 のままキープ（ライン停止）
+      } else if (nxt.kind === "waste_disposal") {
+        const { efficiency } = calcPower(state);
+        if (efficiency >= 1.0) t.beltItem = null;
+        // 電力不足 → ボトルネック
+      } else if (nxt.kind === "nuclear_plant") {
+        if (t.beltItem.kind === "fuel_rod" && !nxt.fuelFed) {
+          nxt.fuelFed = true;
+          t.beltItem  = null;
+        }
+      } else if ((nxt.kind === "belt" || nxt.kind === "filter") && nxt.beltItem === null) {
+        const [wx, , wz] = tileToWorld(nr, nc, gridSize);
+        nxt.beltItem = { kind: t.beltItem.kind, progress: 0.0, worldX: wx, worldZ: wz };
+        t.beltItem   = null;
+      } else if (nxt.kind === "assembler" && nxt.beltItem === null) {
+        const [wx, , wz] = tileToWorld(nr, nc, gridSize);
+        nxt.beltItem = { kind: t.beltItem.kind, progress: 0.0, worldX: wx, worldZ: wz };
+        t.beltItem   = null;
       }
+      // 上記以外 → ボトルネック
     }
   }
 
-  return { newGrid, earnedMoney, shippedStone, shippedIron, shippedGear };
+  return { newGrid: ng, earnedMoney, shippedStone, shippedIron, shippedUranium, shippedGear, shippedFuel, shippedWaste };
 }
 
-// ─── ドリルの生産処理 ────────────────────────────────────────────────
-
-/**
- * ドリルタイルの生産タイマーを進め、アイテムを排出する。
- * アイテムは前方のベルトに排出される。前方が詰まっていれば生産停止。
- *
- * @returns 更新後のグリッド
- */
+// ─── ドリル生産 ──────────────────────────────────────────────────────
 export function tickDrills(
-  state: GameState,
-  newGrid: Tile[][],
-  dt: number,
-  efficiency: number
+  state: GameState, ng: Tile[][], dt: number, efficiency: number,
 ): Tile[][] {
-  const { gridSize, upgrades } = state;
-  const drillBonus = upgrades.turbodrillBoost ? 1 : 0;
+  const { gridSize, upgrades, ngPlusBuff } = state;
+  const drillBonus = upgrades.turbodrillBoost ? 0.5 : 0;
+  const ngSpeed    = ngPlusBuff.speedMultiplier;
 
   for (let r = 0; r < gridSize; r++) {
     for (let c = 0; c < gridSize; c++) {
-      const t = newGrid[r][c];
-      if (t.kind !== "stone_drill" && t.kind !== "iron_drill") continue;
+      const t       = ng[r][c];
+      const isDrill = t.kind === "stone_drill" || t.kind === "iron_drill" || t.kind === "uranium_drill";
+      if (!isDrill || t.depositRemaining <= 0) continue;
 
-      const interval = t.kind === "stone_drill" ? DRILL_PRODUCTION_INTERVAL : IRON_DRILL_INTERVAL;
-      const adjustedInterval = Math.max(0.2, interval / (1 + drillBonus * 0.5));
-
-      // 前方のタイル（排出先）を確認
       const next = getNeighbor(r, c, t.direction, gridSize);
       if (!next) continue;
       const [nr, nc] = next;
-      const frontTile = newGrid[nr][nc];
+      const front    = ng[nr][nc];
+      if (front.beltItem !== null && front.kind !== "hub" && front.kind !== "space_elevator") continue;
 
-      // 前方が詰まっていればタイマーを進めない（ボトルネック）
-      const isFrontFull =
-        frontTile.beltItem !== null &&
-        frontTile.kind !== "hub" &&
-        frontTile.kind !== "empty";
-      if (isFrontFull) continue;
+      const baseInterval =
+        t.kind === "stone_drill"   ? STONE_DRILL_INTERVAL :
+        t.kind === "iron_drill"    ? IRON_DRILL_INTERVAL  :
+        URANIUM_DRILL_INTERVAL;
+      let interval = baseInterval / (1 + drillBonus) / ngSpeed;
+      if (t.module === "speed") interval /= _MODULE_SPEED_MULT;
 
-      // 鉱床の残量チェック
-      if (t.depositRemaining <= 0) continue;
-
-      // タイマーを進める
       t.productionTimer += dt * efficiency;
+      if (t.productionTimer < interval) continue;
+      t.productionTimer -= interval;
+      t.depositRemaining--;
 
-      if (t.productionTimer >= adjustedInterval) {
-        t.productionTimer -= adjustedInterval;
+      const itemKind: ItemKind =
+        t.kind === "stone_drill"   ? "stone"   :
+        t.kind === "iron_drill"    ? "iron"    : "uranium";
 
-        const itemKind: ItemKind = t.kind === "stone_drill" ? "stone" : "iron";
-
-        // Hubに直接排出
-        if (frontTile.kind === "hub") {
-          // ハブには直接売却しない（ベルト経由のみ）
-          // ハブが隣ならベルト不要で排出可能にする
-        } else if (frontTile.kind === "belt" && frontTile.beltItem === null) {
-          frontTile.beltItem = { kind: itemKind, progress: 0.0 };
-          t.depositRemaining--;
-        }
-        // front がhubなら直接売却（ベルトなし短絡）は仕様外なので何もしない
+      if (front.kind === "belt" && front.beltItem === null) {
+        const [wx, , wz] = tileToWorld(nr, nc, gridSize);
+        front.beltItem = { kind: itemKind, progress: 0.0, worldX: wx, worldZ: wz };
       }
     }
   }
-
-  return newGrid;
+  return ng;
 }
 
-// ─── 組立機の生産処理 ────────────────────────────────────────────────
-
-/**
- * 組立機の生産タイマーを進め、歯車を生産する。
- *
- * 組立機の動作:
- * 1. 自身のbeltItemを内部バッファとして使う。
- * 2. 隣接するベルトから石と鉄を吸い込む（インプット）。
- * 3. 素材が揃ったらタイマーを進め、完成したら前方ベルトへ排出。
- *
- * @returns 更新後のグリッド
- */
+// ─── 組立機生産 ──────────────────────────────────────────────────────
 export function tickAssemblers(
-  state: GameState,
-  newGrid: Tile[][],
-  dt: number,
-  efficiency: number
-): { grid: Tile[][]; stonesConsumed: number; ironConsumed: number } {
-  const { gridSize } = state;
-  let stonesConsumed = 0;
-  let ironConsumed = 0;
+  state: GameState, ng: Tile[][], dt: number, efficiency: number,
+): { grid: Tile[][]; stonesConsumed: number; ironConsumed: number; uraniumConsumed: number; wasteProduced: number } {
+  const { gridSize, ngPlusBuff } = state;
+  const ngSpeed        = ngPlusBuff.speedMultiplier;
+  const wasteReduction = ngPlusBuff.wasteReduction;
+  let stonesConsumed = 0, ironConsumed = 0, uraniumConsumed = 0, wasteProduced = 0;
 
   for (let r = 0; r < gridSize; r++) {
     for (let c = 0; c < gridSize; c++) {
-      const t = newGrid[r][c];
+      const t = ng[r][c];
       if (t.kind !== "assembler") continue;
 
-      // 組立機の内部バッファとしてbeltItemを流用
-      // beltItem.kind === "gear" かつ progress >= 1.0 で排出準備完了
-      if (t.beltItem && t.beltItem.kind === "gear") {
-        // 排出待ち: 前方ベルトが空きなら排出
+      // 排出待ちアイテムを前方ベルトへ押し出す
+      if (t.beltItem && (
+        t.beltItem.kind === "gear" || t.beltItem.kind === "fuel_rod" ||
+        t.beltItem.kind === "waste" || t.beltItem.kind === "radio_waste"
+      )) {
         const next = getNeighbor(r, c, t.direction, gridSize);
         if (next) {
           const [nr, nc] = next;
-          const frontTile = newGrid[nr][nc];
-          if (frontTile.kind === "hub") {
-            // ハブへ直接排出しない（ベルト経由とする）
-          } else if (frontTile.kind === "belt" && frontTile.beltItem === null) {
-            frontTile.beltItem = { kind: "gear", progress: 0.0 };
-            t.beltItem = null;
+          const front    = ng[nr][nc];
+          if (front.kind === "belt" && front.beltItem === null) {
+            const [wx, , wz] = tileToWorld(nr, nc, gridSize);
+            front.beltItem = { kind: t.beltItem.kind, progress: 0.0, worldX: wx, worldZ: wz };
+            t.beltItem     = null;
           }
         }
         continue;
       }
 
-      // 素材の受け取り（隣接するベルトからスキャン）
-      // beltItemに石や鉄が入ってきたらバッファに吸収する
-      // 実際は tickBeltPhysics で既に beltItem に入っているのでそれを使う
+      let interval = ASSEMBLER_INTERVAL / ngSpeed;
+      if (t.module === "speed") interval /= _MODULE_SPEED_MULT;
 
-      // 内部素材バッファを使う（組立機はbeltItemを内部バッファに転用しない）
-      // ここではシンプルに: gameState の stone/iron を消費して生産する方式に切り替える
-      // (完全物理物流はベルトに任せ、組立機はグローバルストックから消費)
-      // ← このコメントは設計意図の記録
-
-      // タイマーを進める
       t.productionTimer += dt * efficiency;
-      if (t.productionTimer >= ASSEMBLER_INTERVAL) {
-        t.productionTimer -= ASSEMBLER_INTERVAL;
-        // 素材消費フラグを立てる（返り値経由でgameStateに反映）
-        stonesConsumed += GEAR_RECIPE.stone;
-        ironConsumed += GEAR_RECIPE.iron;
+      if (t.productionTimer < interval) continue;
+      t.productionTimer -= interval;
 
-        // 前方ベルトへ歯車を排出
-        const next = getNeighbor(r, c, t.direction, gridSize);
-        if (next) {
-          const [nr, nc] = next;
-          const frontTile = newGrid[nr][nc];
-          if (frontTile.kind === "belt" && frontTile.beltItem === null) {
-            frontTile.beltItem = { kind: "gear", progress: 0.0 };
-          } else if (frontTile.kind === "hub") {
-            // ハブに直接排出（歯車）→ tickBeltPhysicsで売却される
-            // ここでは何もしない
+      // レシピ判定
+      const canFuelRod = state.uranium >= FUEL_ROD_RECIPE.uranium && state.iron >= FUEL_ROD_RECIPE.iron;
+      const canGear    = state.stone   >= GEAR_RECIPE.stone       && state.iron >= GEAR_RECIPE.iron;
+      if (!canGear && !canFuelRod) continue;
+
+      const makeFuel         = canFuelRod && state.upgrades.nuclearUnlock;
+      const prodKind: ItemKind = makeFuel ? "fuel_rod" : "gear";
+
+      if (makeFuel) {
+        ironConsumed    += FUEL_ROD_RECIPE.iron;
+        uraniumConsumed += FUEL_ROD_RECIPE.uranium;
+      } else {
+        stonesConsumed += GEAR_RECIPE.stone;
+        ironConsumed   += GEAR_RECIPE.iron;
+      }
+
+      const wasteChance = (t.module === "production" ? WASTE_CHANCE_PROD : WASTE_CHANCE_NORMAL) * (1 - wasteReduction);
+      const hasWaste    = Math.random() < wasteChance;
+      if (hasWaste) wasteProduced++;
+
+      const next = getNeighbor(r, c, t.direction, gridSize);
+      if (next) {
+        const [nr, nc] = next;
+        const front    = ng[nr][nc];
+        if (front.kind === "belt" && front.beltItem === null) {
+          const [wx, , wz] = tileToWorld(nr, nc, gridSize);
+          const outKind: ItemKind = hasWaste ? (makeFuel ? "radio_waste" : "waste") : prodKind;
+          front.beltItem = { kind: outKind, progress: 0.0, worldX: wx, worldZ: wz };
+          if (hasWaste) {
+            t.beltItem = { kind: prodKind, progress: 1.0, worldX: 0, worldZ: 0 };
           }
         }
       }
     }
   }
 
-  return { grid: newGrid, stonesConsumed, ironConsumed };
+  return { grid: ng, stonesConsumed, ironConsumed, uraniumConsumed, wasteProduced };
 }
 
-// ─── 昼夜サイクル ────────────────────────────────────────────────────
+// ─── 水システム ──────────────────────────────────────────────────────
+export function tickWaterSystem(
+  state: GameState, ng: Tile[][], dt: number, efficiency: number,
+): Tile[][] {
+  const { gridSize } = state;
 
-/**
- * 昼夜サイクルのタイマーを更新する。
- * @returns { dayPhase, phaseTimer }
- */
-export function tickDayNight(
-  dayPhase: "day" | "night",
-  phaseTimer: number,
-  dt: number
-): { dayPhase: "day" | "night"; phaseTimer: number; phaseChanged: boolean } {
-  const duration = dayPhase === "day" ? DAY_DURATION : NIGHT_DURATION;
-  const newTimer = phaseTimer + dt;
-  if (newTimer >= duration) {
-    return {
-      dayPhase: dayPhase === "day" ? "night" : "day",
-      phaseTimer: newTimer - duration,
-      phaseChanged: true,
-    };
-  }
-  return { dayPhase, phaseTimer: newTimer, phaseChanged: false };
-}
+  // フラグリセット
+  for (let r = 0; r < gridSize; r++)
+    for (let c = 0; c < gridSize; c++) {
+      if (ng[r][c].kind === "steam_engine")  ng[r][c].waterFed = false;
+      if (ng[r][c].kind === "nuclear_plant") ng[r][c].fuelFed  = false;
+    }
 
-// ─── 鉱床の再発見 ────────────────────────────────────────────────────
-
-let depositRespawnTimer = 0;
-
-/**
- * ランダムな空きマスに新たな鉱床を出現させる。
- * @returns 更新後のグリッドと鉱床追加フラグ
- */
-export function tickDepositRespawn(
-  grid: Tile[][],
-  gridSize: number,
-  dt: number
-): { grid: Tile[][]; spawned: boolean; kind: "stone" | "iron" | null } {
-  depositRespawnTimer += dt;
-  if (depositRespawnTimer < DEPOSIT_RESPAWN_INTERVAL) {
-    return { grid, spawned: false, kind: null };
-  }
-  depositRespawnTimer -= DEPOSIT_RESPAWN_INTERVAL;
-
-  // 空きマス（empty）をリストアップ
-  const empties: [number, number][] = [];
+  // 蒸気機関: 隣接ベルトの水を吸収
   for (let r = 0; r < gridSize; r++) {
     for (let c = 0; c < gridSize; c++) {
-      if (grid[r][c].kind === "empty") empties.push([r, c]);
+      const t = ng[r][c];
+      if (t.kind !== "steam_engine") continue;
+      const dirs: Direction[] = ["up", "right", "down", "left"];
+      for (const dir of dirs) {
+        const nb = getNeighbor(r, c, dir, gridSize);
+        if (!nb) continue;
+        const [nr, nc] = nb;
+        const belt     = ng[nr][nc];
+        if (belt.kind === "belt" && belt.beltItem?.kind === "water") {
+          belt.beltItem = null;
+          t.waterFed    = true;
+          break;
+        }
+      }
     }
   }
+
+  // 給水ポンプ: 水源から水を生産
+  for (let r = 0; r < gridSize; r++) {
+    for (let c = 0; c < gridSize; c++) {
+      const t = ng[r][c];
+      if (t.kind !== "water_pump") continue;
+      const next = getNeighbor(r, c, t.direction, gridSize);
+      if (!next) continue;
+      const [nr, nc] = next;
+      const front    = ng[nr][nc];
+      if (front.kind !== "belt" || front.beltItem !== null) continue;
+      t.productionTimer += dt * efficiency;
+      if (t.productionTimer >= 1.5) {
+        t.productionTimer -= 1.5;
+        const [wx, , wz] = tileToWorld(nr, nc, gridSize);
+        front.beltItem = { kind: "water", progress: 0.0, worldX: wx, worldZ: wz };
+      }
+    }
+  }
+
+  return ng;
+}
+
+// ─── 汚染度更新 ──────────────────────────────────────────────────────
+export function tickContamination(ng: Tile[][], gridSize: number, dt: number): Tile[][] {
+  for (let r = 0; r < gridSize; r++) {
+    for (let c = 0; c < gridSize; c++) {
+      const t        = ng[r][c];
+      const hasWaste = t.beltItem?.kind === "waste" || t.beltItem?.kind === "radio_waste";
+      if (hasWaste) {
+        t.contamination = Math.min(1.0, t.contamination + 0.1 * dt);
+      } else if (t.kind === "waste_disposal") {
+        t.contamination = Math.max(0, t.contamination - 0.5 * dt);
+      } else {
+        t.contamination = Math.max(0, t.contamination - 0.02 * dt);
+      }
+    }
+  }
+  return ng;
+}
+
+// ─── 鉱床再発見 ──────────────────────────────────────────────────────
+let _depositTimer = 0;
+
+export function tickDepositRespawn(
+  grid: Tile[][], gridSize: number, dt: number,
+): { grid: Tile[][]; spawned: boolean; kind: "stone" | "iron" | "uranium" | null } {
+  _depositTimer += dt;
+  if (_depositTimer < DEPOSIT_RESPAWN_SECS) return { grid, spawned: false, kind: null };
+  _depositTimer -= DEPOSIT_RESPAWN_SECS;
+
+  const empties: [number, number][] = [];
+  for (let r = 0; r < gridSize; r++)
+    for (let c = 0; c < gridSize; c++)
+      if (grid[r][c].kind === "empty") empties.push([r, c]);
   if (empties.length === 0) return { grid, spawned: false, kind: null };
 
   const [tr, tc] = empties[Math.floor(Math.random() * empties.length)];
-  const kind = Math.random() < 0.6 ? "stone" : "iron";
-  const newGrid = grid.map(row => row.map(t => ({ ...t })));
-  newGrid[tr][tc] = {
-    ...newGrid[tr][tc],
-    kind: kind === "stone" ? "stone_deposit" : "iron_deposit",
-    depositRemaining: kind === "stone" ? 500 : 300,
+  const rnd      = Math.random();
+  const kind: "stone" | "iron" | "uranium" = rnd < 0.5 ? "stone" : rnd < 0.85 ? "iron" : "uranium";
+  const ng       = grid.map(row => row.map(t => ({ ...t })));
+  ng[tr][tc] = {
+    ...ng[tr][tc],
+    kind: `${kind}_deposit` as "stone_deposit" | "iron_deposit" | "uranium_deposit",
+    depositRemaining: kind === "stone" ? 500 : kind === "iron" ? 300 : 150,
   };
 
-  return { grid: newGrid, spawned: true, kind };
+  return { grid: ng, spawned: true, kind };
 }
 
-// ─── グリッド初期化 ──────────────────────────────────────────────────
-
-/** 指定サイズのグリッドを初期化する */
-export function createGrid(size: number, prevGrid?: Tile[][]): Tile[][] {
-  const grid: Tile[][] = [];
-  for (let r = 0; r < size; r++) {
-    const row: Tile[] = [];
-    for (let c = 0; c < size; c++) {
-      // 既存グリッドのデータを引き継ぐ（拡張時）
-      if (prevGrid && r < prevGrid.length && c < prevGrid[r].length) {
-        row.push(prevGrid[r][c]);
-      } else {
-        row.push({
-          id: `tile_${r}_${c}`,
-          kind: "empty",
-          direction: "right",
-          beltItem: null,
-          productionTimer: 0,
-          depositRemaining: 0,
-        });
-      }
+// ─── マイルストーン進捗チェック ──────────────────────────────────────
+export function checkMilestones(
+  state: GameState,
+): { milestones: typeof state.milestones; newlyCompleted: string[] } {
+  const newlyCompleted: string[] = [];
+  const updated = state.milestones.map(m => {
+    if (m.completed) return m;
+    const allMet = Object.entries(m.requires).every(([item, count]) => {
+      const key = item as "gear" | "fuel_rod" | "iron" | "stone" | "uranium";
+      const shipped =
+        key === "gear"     ? state.totalGearsShipped    :
+        key === "fuel_rod" ? state.totalFuelShipped      :
+        key === "iron"     ? state.totalIronShipped      :
+        key === "stone"    ? state.totalStonesShipped    :
+        key === "uranium"  ? state.totalUraniumShipped   : 0;
+      return shipped >= (count as number);
+    });
+    if (allMet) {
+      newlyCompleted.push(m.id);
+      return { ...m, completed: true };
     }
-    grid.push(row);
-  }
-  return grid;
+    return m;
+  });
+  return { milestones: updated, newlyCompleted };
 }
 
-/** ゲームの初期グリッドを生成（鉱床・ハブを配置） */
+// ─── グリッド初期化・拡張 ────────────────────────────────────────────
+function emptyTile(r: number, c: number): Tile {
+  return {
+    id: `t_${r}_${c}`, kind: "empty", direction: "right",
+    beltItem: null, productionTimer: 0, depositRemaining: 0,
+    module: null, filterConfig: {}, waterFed: false, fuelFed: false, contamination: 0,
+  };
+}
+
 export function createInitialGrid(size: number): Tile[][] {
-  const grid = createGrid(size);
-  const hubR = Math.floor(size / 2);
-  const hubC = Math.floor(size / 2);
+  const grid: Tile[][] = Array.from({ length: size }, (_, r) =>
+    Array.from({ length: size }, (_, c) => emptyTile(r, c))
+  );
+  const hubR = Math.floor(size / 2), hubC = Math.floor(size / 2);
+  grid[hubR][hubC] = { ...emptyTile(hubR, hubC), kind: "hub" };
+  grid[0][0]       = { ...emptyTile(0, 0), kind: "water_source" };
 
-  // ハブを配置（中央）
-  grid[hubR][hubC] = {
-    id: `tile_${hubR}_${hubC}`,
-    kind: "hub",
-    direction: "right",
-    beltItem: null,
-    productionTimer: 0,
-    depositRemaining: 0,
-  };
+  const stonePos:   [number, number][] = [[0, size-1],[1,2],[3,1],[size-1,size-2]];
+  const ironPos:    [number, number][] = [[0,2],[2,size-1],[size-1,0]];
+  const uraniumPos: [number, number][] = [[size-2, 1]];
 
-  // 石鉱床
-  const stonePositions: [number, number][] = [
-    [0, 0], [0, size - 1], [1, 2], [3, 1], [size - 1, size - 2],
-  ];
-  stonePositions.forEach(([r, c]) => {
-    if (r < size && c < size && !(r === hubR && c === hubC)) {
-      grid[r][c] = {
-        id: `tile_${r}_${c}`,
-        kind: "stone_deposit",
-        direction: "right",
-        beltItem: null,
-        productionTimer: 0,
-        depositRemaining: 500,
-      };
-    }
+  stonePos.forEach(([r, c]) => {
+    if (r < size && c < size && !(r === hubR && c === hubC))
+      grid[r][c] = { ...emptyTile(r, c), kind: "stone_deposit", depositRemaining: 500 };
   });
-
-  // 鉄鉱床
-  const ironPositions: [number, number][] = [
-    [0, 2], [2, size - 1], [size - 1, 0], [size - 2, size - 2],
-  ];
-  ironPositions.forEach(([r, c]) => {
-    if (r < size && c < size && !(r === hubR && c === hubC)) {
-      grid[r][c] = {
-        id: `tile_${r}_${c}`,
-        kind: "iron_deposit",
-        direction: "right",
-        beltItem: null,
-        productionTimer: 0,
-        depositRemaining: 300,
-      };
-    }
+  ironPos.forEach(([r, c]) => {
+    if (r < size && c < size && !(r === hubR && c === hubC) && grid[r][c].kind === "empty")
+      grid[r][c] = { ...emptyTile(r, c), kind: "iron_deposit", depositRemaining: 300 };
+  });
+  uraniumPos.forEach(([r, c]) => {
+    if (r < size && c < size && grid[r][c].kind === "empty")
+      grid[r][c] = { ...emptyTile(r, c), kind: "uranium_deposit", depositRemaining: 150 };
   });
 
   return grid;
 }
 
-// ─── グリッド拡張 ────────────────────────────────────────────────────
-
-/**
- * 既存グリッドを新しいサイズに拡張する。
- * 既存タイルはそのまま保持し、新しいタイルは empty で埋める。
- * 新しいサイズが奇数であれば中央は常にハブが来るよう調整する。
- */
-export function expandGrid(prevGrid: Tile[][], newSize: number): Tile[][] {
-  const expanded = createGrid(newSize, prevGrid);
-  // 既存のハブ位置を確認（新しい中央に移動しない）
-  // ハブは元の位置のまま保持する（引き継ぎで対応済み）
-  return expanded;
+export function expandGrid(prev: Tile[][], newSize: number): Tile[][] {
+  return Array.from({ length: newSize }, (_, r) =>
+    Array.from({ length: newSize }, (_, c) =>
+      (prev[r] && prev[r][c]) ? prev[r][c] : emptyTile(r, c)
+    )
+  );
 }
 
-// ─── ロケット打ち上げ条件チェック ─────────────────────────────────────
-
+// ─── ロケット打ち上げ条件 ─────────────────────────────────────────────
+// ★修正: require() を廃止し、ESM import で取得した ROCKET_REQUIREMENTS を直接使用
 export function checkRocketReady(
-  money: number,
-  totalGearsShipped: number,
-  totalIronShipped: number
+  money: number, gearsShipped: number, fuelShipped: number,
 ): boolean {
   return (
-    money >= ROCKET_REQUIREMENTS.money &&
-    totalGearsShipped >= ROCKET_REQUIREMENTS.gear &&
-    totalIronShipped >= ROCKET_REQUIREMENTS.iron
+    money        >= ROCKET_REQUIREMENTS.money    &&
+    gearsShipped >= ROCKET_REQUIREMENTS.gear     &&
+    fuelShipped  >= ROCKET_REQUIREMENTS.fuel_rod
   );
 }
 
 // ─── 統計スナップショット ─────────────────────────────────────────────
-
-/** 最大10件の統計履歴を管理する */
 export function pushSnapshot(
-  history: import("../types").StatsSnapshot[],
-  snap: import("../types").StatsSnapshot
-): import("../types").StatsSnapshot[] {
+  history: StatsSnapshot[], snap: StatsSnapshot,
+): StatsSnapshot[] {
   const next = [...history, snap];
   if (next.length > 10) next.shift();
   return next;
