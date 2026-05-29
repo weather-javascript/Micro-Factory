@@ -23,16 +23,24 @@ function SceneLighting({ phase }: { phase: string }) {
       if (sunRef.current) { sunRef.current.position.set(20, 5, -8); sunRef.current.color.setHex(0xff6020); sunRef.current.intensity = 2.5; }
       if (fillRef.current) { fillRef.current.color.setHex(0x4040a0); fillRef.current.intensity = 0.6; }
     } else if (phase === "night") {
-      if (sunRef.current) { sunRef.current.position.set(-10, 15, -10); sunRef.current.color.setHex(0x2040a0); sunRef.current.intensity = 0.8; }
-      if (fillRef.current) { fillRef.current.color.setHex(0x103060); fillRef.current.intensity = 0.5; }
+      // 夜間: 強度を大幅アップして視認性確保
+      if (sunRef.current) { sunRef.current.position.set(-10, 15, -10); sunRef.current.color.setHex(0x4060c0); sunRef.current.intensity = 1.5; }
+      if (fillRef.current) { fillRef.current.color.setHex(0x2050a0); fillRef.current.intensity = 1.0; }
     } else {
       if (sunRef.current) { sunRef.current.position.set(-15, 8, 10); sunRef.current.color.setHex(0xff8060); sunRef.current.intensity = 1.5; }
       if (fillRef.current) { fillRef.current.color.setHex(0x6060a0); fillRef.current.intensity = 0.7; }
     }
   });
 
-  const ambientIntensity = phase === "day" ? 0.9 : phase === "dusk" ? 0.7 : phase === "night" ? 0.65 : 0.7;
-  const ambientColor = phase === "night" ? "#1a2a4a" : phase === "dusk" ? "#2a1810" : "#202030";
+  const ambientIntensity =
+    phase === "day"   ? 0.9 :
+    phase === "dusk"  ? 0.7 :
+    phase === "night" ? 1.2 :  // 0.65 → 1.2
+    0.7;
+
+  const ambientColor =
+    phase === "night" ? "#2a3a6a" :  // 明るめの青
+    phase === "dusk"  ? "#2a1810" : "#202030";
 
   return (
     <>
@@ -146,8 +154,11 @@ export function GameCanvas({ state, selectedShop, selectedTile, onTileClick, roc
       {isNight && (
         <>
           <Stars radius={80} depth={50} count={4000} factor={4} saturation={0.4} fade speed={0.4}/>
-          <fog attach="fog" args={["#010308", 30, 110]}/>
-          <hemisphereLight color="#204080" groundColor="#060810" intensity={0.8}/>
+          {/* 夜でも見えるよう環境光を強化 */}
+          <ambientLight color="#3050a0" intensity={1.2}/>
+          <hemisphereLight color="#4060c0" groundColor="#1a2040" intensity={1.0}/>
+         {/* グリッド全体を照らすエリアライト */}
+          <pointLight position={[0, 12, 0]} color="#6080ff" intensity={2.0} distance={60}/>
         </>
       )}
       {dayPhase === "dawn" && (
